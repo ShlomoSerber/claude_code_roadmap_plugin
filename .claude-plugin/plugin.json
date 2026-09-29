@@ -1,0 +1,10 @@
+{
+  "name": "roadmap",
+  "displayName": "Roadmap",
+  "version": "0.1.0",
+  "description": "Plan a batch of tasks as a roadmap of session-sized units, then run it as a chain of fresh interactive sessions: a model per unit, usage limits checked between sessions, context-size awareness inside each one, and an unattended mode that blocks what needs you instead of waiting.",
+  "author": { "name": "Shlomo Serber", "url": "https://github.com/ShlomoSerber" },
+  "repository": "https://github.com/ShlomoSerber/claude_code_roadmap_plugin",
+  "license": "MIT",
+  "keywords": ["roadmap", "plan", "runner", "sessions", "context", "unattended", "token-savings"]
+}

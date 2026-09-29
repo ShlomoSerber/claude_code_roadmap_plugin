@@ -1,0 +1,12 @@
+{
+  "name": "roadmap",
+  "description": "Roadmap: plan many tasks at once and run them as a chain of small, fresh Claude Code sessions.",
+  "owner": { "name": "Shlomo Serber", "url": "https://github.com/ShlomoSerber" },
+  "plugins": [
+    {
+      "name": "roadmap",
+      "source": "./",
+      "description": "/roadmap:plan, /roadmap:execute, /roadmap:unattend, /roadmap:attend and the `roadmap` CLI: session-sized units, a model per unit, usage limits, context awareness, unattended runs."
+    }
+  ]
+}

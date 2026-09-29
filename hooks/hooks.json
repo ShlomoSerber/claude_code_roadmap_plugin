@@ -1,0 +1,27 @@
+{
+  "description": "Only inside sessions launched by `roadmap execute`. PreToolUse: in unattended mode, deny questions and plan mode. PostToolUse: heartbeat, and context-size warnings against the roadmap's limit. Stop: close the session once the unit is closed; in unattended mode, refuse to stop with the unit open.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "AskUserQuestion|EnterPlanMode|ExitPlanMode",
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/hook.sh pre-tool", "timeout": 10 }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/hook.sh post-tool", "timeout": 10 }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}\"/scripts/hook.sh stop", "timeout": 10 }
+        ]
+      }
+    ]
+  }
+}
