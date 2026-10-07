@@ -20,6 +20,11 @@ file by hand, and never touch the status of another unit.
 
 ## Rules
 
+- **Worktree.** When the brief shows `Worktree:`, other sessions are working in parallel, each in
+  its own worktree. Work, build, test and commit only inside yours, on its branch. Never check out
+  another branch, merge (except a `Pending merge`), rebase, push, or touch the repo's own checkout
+  (`Repo:`), even when `ROADMAP.md` mentions pushing: the runner merges your branch into the
+  roadmap branch when the unit closes, and pushes if the roadmap says so.
 - **The roadmap's rules come first.** `ROADMAP.md` above says the branch, the push policy, what is
   forbidden, and what "verified" means. Follow it over any default here.
 - **Targeted reads.** Read the unit file (above) and what its "Leer antes" names. Do not read
@@ -44,7 +49,7 @@ file by hand, and never touch the status of another unit.
 
 ## Steps
 
-1. **Orient.** If the unit file has a `## Nota de traspaso`, `## Nota del runner` or answers from
+1. **Orient.** If the brief shows `Pending merge`, do that merge first, as it says. If the unit file has a `## Nota de traspaso`, `## Nota del runner` or answers from
    `/roadmap:attend`, start from them: check `git log --oneline -15` and `git status` against the
    note, and redo whatever it says was not committed.
 2. **Documentador**, only when the brief shows `Documentador: project … · task …`: `start_task` on
@@ -53,7 +58,7 @@ file by hand, and never touch the status of another unit.
 4. **Do the work**, following the unit's "Cómo" and the repo's own conventions (`CLAUDE.md`).
 5. **Verify** with the unit's "Verificación" and the roadmap's rules. Red means not done: fix it,
    or hand off. Never close red.
-6. **Commit**, and push only if `ROADMAP.md` says so.
+6. **Commit**, and push only if `ROADMAP.md` says so and the brief shows no `Worktree:`.
 7. **Close.**
    - Append `## Nota de cierre` to the unit file: commits, what was delivered, what was left out of
      the scope, assumptions you took, and what later units must know. Five to fifteen lines.

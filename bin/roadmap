@@ -5,17 +5,20 @@ A roadmap lives in <repo>/.claude/roadmaps/<name>/:
   roadmap.json   the state (schema: DESIGN.md §2). After /roadmap:plan, only this CLI writes it.
   ROADMAP.md     the goal and the rules every session follows.
   units/         one brief per unit; sessions append their closing, handoff, split and block notes.
-  run/           signal, heartbeat, hook state and runner.log. Transient.
+  run/           runner.log, locks, hook state, and units/<id>/ (launch spec, pids, signal,
+                 heartbeat, last session) per unit. Transient.
 
-For people:   execute, status, list, usage, attend, unattend, install-cli
+For people:   execute, status, list, usage, attend, unattend, config, install-cli
 For sessions: brief, blocked, done, handoff, block, unblock, split, set, init, validate, next, baseline
 For hooks:    hook pre-tool|post-tool|stop   (scripts/hook.sh, only inside a runner session)
+For the runner: worker   (runs one session in its terminal tab or window)
 
 User-facing messages are in Spanish (es-AR); messages the model reads from hooks are in English.
 """
 import argparse
 import datetime as dt
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -44,6 +47,15 @@ PAUSE_SECONDS = int(os.environ.get("ROADMAP_PAUSE_SECONDS", "15"))
 UNATTENDED_PAUSE_SECONDS = 5
 MAX_CONTINUES = int(os.environ.get("ROADMAP_MAX_CONTINUES", "3"))
 IDLE_MINUTES = float(os.environ.get("ROADMAP_IDLE_MINUTES", "30"))
+MAX_PARALLEL = 8
+LAUNCH_TIMEOUT_SECONDS = 90          # a launched tab or window whose worker never starts
+POLL_SECONDS = 2
+STAGGER_SECONDS = 3                  # between two launches, so tabs open in order
+TERMINALS = ("warp", "gnome-terminal", "inline")
+WORKTREE_ROOT = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                             "claude-roadmap", "worktrees")
+WARP_TAB_CONFIGS = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                                "warp-terminal", "tab_configs")
 QUICK_EXIT_SECONDS = 45             # a session that ends sooner without a signal never started working
 STOP_BLOCKS = 3                      # unattended: Stop-hook refusals before the unit is blocked
 CONTEXT_LEVELS = (0.60, 0.80, 0.93)  # fractions of context_limit where the post-tool hook speaks
@@ -143,8 +155,10 @@ def all_roadmaps(root):
 
 def resolve(name=None):
     """The roadmap directory: the runner's (ROADMAP_DIR), the one named, or the only open one."""
-    if not name and os.environ.get("ROADMAP_DIR") and os.path.isfile(rm_path(os.environ["ROADMAP_DIR"])):
-        return os.environ["ROADMAP_DIR"]
+    env = os.environ.get("ROADMAP_DIR")
+    # A runner session may work in a worktree slot, outside the repo that holds the roadmap.
+    if env and os.path.isfile(rm_path(env)) and (not name or name == os.path.basename(env.rstrip("/"))):
+        return env
     root = git_root()
     base = base_dir(root)
     if name:
@@ -196,20 +210,52 @@ def log(d, msg):
         pass
 
 
+def unit_run(d, uid):
+    """run/units/<id>/: the files of the unit's current session (launch spec, pids, signal, heartbeat)."""
+    return os.path.join(run_dir(d), "units", uid)
+
+
+def unit_file(d, uid, name):
+    return os.path.join(unit_run(d, uid), name)
+
+
 def write_signal(d, kind, uid):
-    os.makedirs(run_dir(d), exist_ok=True)
-    tmp = run_file(d, "signal.tmp")
+    os.makedirs(unit_run(d, uid), exist_ok=True)
+    tmp = unit_file(d, uid, "signal.tmp")
     with open(tmp, "w") as f:
         f.write(f"{kind} {uid}\n")
-    os.replace(tmp, run_file(d, "signal"))
+    os.replace(tmp, unit_file(d, uid, "signal"))
 
 
-def read_signal(d):
+def read_signal(d, uid):
     try:
-        with open(run_file(d, "signal")) as f:
+        with open(unit_file(d, uid, "signal")) as f:
             return f.read().strip()
     except OSError:
         return ""
+
+
+def rm_f(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def read_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return default
+
+
+def write_json(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
 
 
 def touch(path):
@@ -253,15 +299,23 @@ def unit_arg(uid):
     return uid
 
 
-def satisfied(units, uid):
-    """A dependency is met when the unit is done, or split and every child is met."""
+def worktrees(rm):
+    """parallel > 1: every session works in a worktree slot on its unit's branch, and the runner
+    merges each closed unit into the roadmap branch. parallel 1: one session at a time in the
+    repo's own checkout, as before."""
+    return int(rm.get("parallel") or 1) > 1
+
+
+def satisfied(units, uid, merged=False):
+    """A dependency is met when the unit is done (and merged, with worktrees), or split and every
+    child is met."""
     u = units.get(uid)
     if not u:
         return False
     if u["status"] == "done":
-        return True
+        return not merged or bool(u.get("merged_at"))
     if u["status"] == "split":
-        return all(satisfied(units, c) for c in u.get("children") or [])
+        return all(satisfied(units, c, merged) for c in u.get("children") or [])
     return False
 
 
@@ -281,31 +335,59 @@ def stuck(units, uid, seen=None):
     return False
 
 
-def eligible(rm):
-    """The unit the next session takes: one already in progress, else the first pending whose
-    dependencies are met. A '*' dependency waits until every other unit is done, blocked, or
-    stuck behind a blocked one."""
+def overlaps(a, b):
+    """Two `touches` lists share a path: equal, or one is a directory prefix of the other."""
+    for x in a or []:
+        for y in b or []:
+            x_, y_ = x.strip("/") + "/", y.strip("/") + "/"
+            if x_.startswith(y_) or y_.startswith(x_):
+                return True
+    return False
+
+
+def ready(rm, running=()):
+    """Units a session could take now, in order: those already in progress (not running), then
+    pending ones whose dependencies are met. With worktrees a dependency counts once merged, a
+    split child waits for its parent's merge, and a unit never runs beside one it shares
+    `touches` with. A '*' dependency waits until every other unit is done, blocked, or stuck
+    behind a blocked one, and nothing else runs."""
     units = rm["units"]
     ids = by_id(rm)
+    merged = worktrees(rm)
+    busy = [ids[r] for r in running if r in ids]
+    out_ = []
     for u in units:
-        if u["status"] == "in_progress":
-            return u
+        if u["status"] == "in_progress" and u["id"] not in running:
+            out_.append(u)
     for u in units:
-        if u["status"] != "pending":
+        if u["status"] != "pending" or u["id"] in running:
             continue
         deps = u.get("depends_on") or []
         if "*" in deps:
-            ok = all(x["status"] in ("done", "blocked", "split") or stuck(ids, x["id"])
-                     for x in units if x is not u)
+            ok = not running and all(
+                (x["status"] in ("done", "blocked", "split") or stuck(ids, x["id"]))
+                and not (merged and x["status"] == "done" and not x.get("merged_at"))
+                for x in units if x is not u)
         else:
-            ok = all(satisfied(ids, dep) for dep in deps)
+            ok = all(satisfied(ids, dep, merged) for dep in deps)
+        if ok and merged and u.get("parent"):
+            p = ids.get(u["parent"])
+            ok = bool(p and p.get("merged_at"))
         if ok:
-            return u
-    return None
+            out_.append(u)
+    return [u for u in out_ if not any(overlaps(u.get("touches"), b.get("touches")) for b in busy)]
+
+
+def eligible(rm):
+    """The unit the next session takes when nothing runs."""
+    r = ready(rm)
+    return r[0] if r else None
 
 
 def is_finished(rm):
-    return all(u.get("status") in ("done", "split") for u in rm.get("units", []))
+    """Every unit closed. A roadmap with no units yet is still being planned, so it is open."""
+    units = rm.get("units") or []
+    return bool(units) and all(u.get("status") in ("done", "split") for u in units)
 
 
 def problems(rm, d):
@@ -336,6 +418,16 @@ def problems(rm, d):
     doc = rm.get("documentador")
     if doc is not None and not (isinstance(doc, dict) and doc.get("project_id")):
         p.append("documentador debe ser null o {\"project_id\": ...}")
+    par = rm.get("parallel", 1)
+    if not isinstance(par, int) or isinstance(par, bool) or not 1 <= par <= MAX_PARALLEL:
+        p.append(f"parallel debe ser un entero entre 1 y {MAX_PARALLEL}")
+    if rm.get("branch") is not None and not (isinstance(rm["branch"], str) and rm["branch"].strip()):
+        p.append("branch debe ser el nombre de una rama")
+    if not isinstance(rm.get("push", False), bool):
+        p.append("push debe ser true o false")
+    setup = rm.get("setup", [])
+    if not isinstance(setup, list) or not all(isinstance(x, str) and x.strip() for x in setup):
+        p.append("setup debe ser una lista de comandos")
     units = rm.get("units")
     if not isinstance(units, list) or not units:
         p.append("units está vacío")
@@ -370,6 +462,9 @@ def problems(rm, d):
                 p.append(f"{uid}: depende de '{dep}', que no existe")
         if "*" in deps:
             stars += 1
+        t = u.get("touches", [])
+        if not isinstance(t, list) or not all(isinstance(x, str) and x.strip() for x in t):
+            p.append(f"{uid}: touches debe ser una lista de rutas")
         if isinstance(u.get("file"), str) and not os.path.isfile(os.path.join(d, u["file"])):
             p.append(f"{uid}: no existe {u['file']}")
         if u.get("status") == "blocked" and not (u.get("blocked") or {}).get("question"):
@@ -578,7 +673,8 @@ def cmd_init(a):
         "created": dt.date.today().isoformat(),
         "mode": "attended", "permission_mode": "bypass",
         "context_limit": DEFAULT_CONTEXT_LIMIT, "limits": dict(DEFAULT_LIMITS),
-        "default_model": "opus", "documentador": None, "units": [],
+        "default_model": "opus", "documentador": None,
+        "parallel": 1, "branch": None, "push": False, "setup": [], "units": [],
     }
     save(d, rm)
     with open(os.path.join(d, "ROADMAP.md"), "w") as f:
@@ -618,6 +714,10 @@ def cmd_brief(a):
     out(f"Mode: {rm['mode']}")
     out(f"Context limit: {rm['context_limit']} tokens")
     out(f"Runner session: {'yes' if os.environ.get('ROADMAP_RUNNER') == '1' else 'no'}")
+    wt = os.environ.get("ROADMAP_WORKTREE")
+    if wt:
+        out(f"Worktree: {wt} (branch {unit_branch(rm, uid or '?')}). Work and commit only here; the runner "
+            f"merges this branch into {rm.get('branch')} when the unit closes.")
     if not uid:
         out("Unit: none given")
         return
@@ -626,6 +726,9 @@ def cmd_brief(a):
     out(f"  status {u['status']} · model {u['model']} · est {k(u['est_tokens']) if u.get('est_tokens') else '?'}"
         f" · handoffs {u.get('handoffs', 0)} · depends on {', '.join(u.get('depends_on') or []) or '-'}")
     out(f"  file {os.path.join(d, u['file'])}")
+    if u.get("pending_merge"):
+        out(f"Pending merge: {u['pending_merge']}. Before anything else, `git merge {u['pending_merge']}` in the "
+            "worktree, resolve the conflicts keeping the intent of both sides, verify, and commit.")
     if doc and u.get("task"):
         out(f"Documentador: project {doc['project_id']} · task {u['task']}")
     else:
@@ -750,7 +853,7 @@ def cmd_split(a):
         out("  " + c)
 
 
-SETTABLE = ("title", "model", "status", "est_tokens", "depends_on", "task")
+SETTABLE = ("title", "model", "status", "est_tokens", "depends_on", "task", "touches")
 
 
 def cmd_set(a):
@@ -765,7 +868,7 @@ def cmd_set(a):
                 fail(f"'{key}' no se puede cambiar; se puede: {', '.join(SETTABLE)}")
             if key == "est_tokens":
                 val = int(val)
-            elif key == "depends_on":
+            elif key in ("depends_on", "touches"):
                 val = [] if val in ("", "-") else [x.strip() for x in val.split(",") if x.strip()]
             elif key == "task":
                 val = None if val in ("", "-", "null") else (int(val) if val.isdigit() else val)
@@ -846,15 +949,22 @@ def cmd_status(a):
     out(f"Roadmap {rm['name']} · {rm['title']}  [modo {MODE_LABEL.get(rm['mode'], rm['mode'])}]")
     out(f"Topes: 5 horas {lim.get('five_hour')}% (espera) · semanal {lim.get('weekly')}% (para) · "
         f"Fable {lim.get('fable')}% (para) · contexto {k(rm.get('context_limit', 0))} por sesión")
+    if worktrees(rm):
+        out(f"En paralelo: hasta {rm['parallel']} sesiones, cada una en su worktree; integra en "
+            f"{rm.get('branch') or '(la rama actual)'}{' y hace push' if rm.get('push') else ''}")
+    running = [u["id"] for u in rm["units"] if worker_alive(d, u["id"])]
     out(f"{'ID':<8} {'Estado':<10} {'Modelo':<8} {'Est.':>5} {'Real':>5}  Unidad")
     for u in rm["units"]:
         real = max((s.get("context_last") or 0 for s in u.get("sessions") or []), default=0)
-        out(f"{u['id']:<8} {LABEL.get(u['status'], u['status']):<10} {u['model']:<8} "
+        st = "corriendo" if u["id"] in running else LABEL.get(u["status"], u["status"])
+        if u["status"] == "done" and worktrees(rm) and not u.get("merged_at"):
+            st = "sin merge"
+        out(f"{u['id']:<8} {st:<10} {u['model']:<8} "
             f"{k(u['est_tokens']) if u.get('est_tokens') else '-':>5} {k(real) if real else '-':>5}  {u['title']}")
         if u["status"] == "blocked":
             out(f"{'':<8} ? {(u.get('blocked') or {}).get('question', '')}")
-    nxt = eligible(rm)
-    out(f"Próxima: {nxt['id'] + ' · ' + nxt['title'] if nxt else '-'}")
+    nxt = ready(rm, running)
+    out(f"Próximas: {', '.join(x['id'] for x in nxt[:MAX_PARALLEL]) if nxt else '-'}")
     if problems(rm, d):
         out("Hay problemas: corré `roadmap validate`.")
 
@@ -893,6 +1003,39 @@ def set_mode(a, mode):
             "hace una pausa de 15 s entre sesiones.")
 
 
+CONFIG_KEYS = ("parallel", "branch", "push", "setup", "context_limit", "permission_mode", "default_model")
+
+
+def cmd_config(a):
+    d = resolve(rname(a))
+    if not a.pairs:
+        rm = load(d)
+        for key in CONFIG_KEYS:
+            out(f"{key} = {json.dumps(rm.get(key), ensure_ascii=False)}")
+        return
+    with locked(d) as rm:
+        for pair in a.pairs:
+            if "=" not in pair:
+                fail(f"'{pair}' no es clave=valor")
+            key, val = pair.split("=", 1)
+            if key not in CONFIG_KEYS:
+                fail(f"'{key}' no se puede cambiar; se puede: {', '.join(CONFIG_KEYS)}")
+            if key in ("parallel", "context_limit"):
+                val = int(val)
+            elif key == "push":
+                val = val.lower() in ("1", "true", "yes", "si", "sí")
+            elif key == "setup":
+                val = json.loads(val) if val.strip().startswith("[") else ([val] if val.strip() else [])
+            elif key == "branch":
+                val = val or None
+            rm[key] = val
+        bad = problems(rm, d)
+        if bad:
+            fail("el cambio deja el roadmap inválido:\n  " + "\n  ".join(bad))
+    log(d, f"config {' '.join(a.pairs)}")
+    out("Roadmap actualizado. El runner lo toma antes de lanzar la próxima sesión.")
+
+
 def cmd_usage(a):
     us = read_usage()
     out(usage_line(us) if us else "No pude leer el uso de la cuenta (~/.claude/.credentials.json o la red).")
@@ -923,21 +1066,277 @@ def permission_args(rm):
     return ["--dangerously-skip-permissions"] if mode == "bypass" else ["--permission-mode", mode]
 
 
-def open_terminal(d, extra):
-    """/roadmap:execute: start the runner in a new terminal window, detached from this session."""
+# ---------------------------------------------------------------- git and worktree slots
+
+def git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True)
+
+
+def unit_branch(rm, uid):
+    return f"roadmap/{rm['name']}/{uid}"
+
+
+def current_branch(path):
+    r = git(path, "symbolic-ref", "-q", "--short", "HEAD")
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def branch_exists(root, br):
+    return git(root, "rev-parse", "-q", "--verify", f"refs/heads/{br}").returncode == 0
+
+
+def is_ancestor(root, a, b):
+    return git(root, "merge-base", "--is-ancestor", a, b).returncode == 0
+
+
+def ensure_branch(d):
+    """The branch closed units merge into: `branch` in roadmap.json, else the repo's current branch
+    (saved). Created from HEAD when it does not exist."""
+    root = repo_of(d)
+    br = load(d).get("branch")
+    if not br:
+        br = current_branch(root)
+        if not br:
+            die("el repo está en detached HEAD y el roadmap no tiene rama: roadmap config branch=<rama>")
+        with locked(d) as rm:
+            rm["branch"] = br
+        log(d, f"branch {br} (the repo's current branch)")
+    if not branch_exists(root, br):
+        r = git(root, "branch", br)
+        if r.returncode:
+            die(f"no pude crear la rama {br}: {r.stderr.strip()}")
+        say(f"creé la rama {br} desde HEAD.")
+    return br
+
+
+def slots_root(root):
+    h = hashlib.sha1(os.path.realpath(root).encode()).hexdigest()[:8]
+    return os.path.join(WORKTREE_ROOT, f"{slug(os.path.basename(root))}-{h}")
+
+
+def slot_path(root, n):
+    return os.path.join(slots_root(root), f"slot-{n}")
+
+
+def claude_config_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR")
+    return os.path.join(base, ".claude.json") if base else os.path.expanduser("~/.claude.json")
+
+
+def is_trusted(data, path):
+    return bool(((data.get("projects") or {}).get(path) or {}).get("hasTrustDialogAccepted"))
+
+
+def trust_slot(root, path):
+    """Mark a slot as trusted in ~/.claude.json, as if the user had answered the folder trust
+    dialog there. Only for slots of a repo the user already trusts. Claude Code rewrites that file
+    often, so this runs before every launch."""
+    cfg = claude_config_path()
+    data = read_json(cfg)
+    if not isinstance(data, dict):
+        return False
+    if is_trusted(data, path):
+        return True
+    if not (is_trusted(data, root) or is_trusted(data, os.path.realpath(root))):
+        return False
+    data.setdefault("projects", {}).setdefault(path, {})["hasTrustDialogAccepted"] = True
+    tmp = cfg + ".roadmap.tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    shutil.copymode(cfg, tmp)
+    os.replace(tmp, cfg)
+    return True
+
+
+def release_slot(path, label):
+    """Leave a slot clean and detached. Uncommitted work goes to a stash, never lost. Returns the
+    stash message, or None."""
+    if not os.path.exists(os.path.join(path, ".git")):
+        return None
+    msg = None
+    if git(path, "status", "--porcelain").stdout.strip():
+        msg = f"roadmap {label} {now()}"
+        git(path, "stash", "push", "--include-untracked", "-m", msg)
+    git(path, "checkout", "-q", "--detach")
+    return msg
+
+
+def prepare_slot(d, rm, n, uid):
+    """Check the unit's branch out in slot n: the existing branch (a handoff, a reopened unit), else
+    a new one from the roadmap branch. Returns the slot path; raises RuntimeError."""
+    root = repo_of(d)
+    path = slot_path(root, n)
+    if not os.path.exists(os.path.join(path, ".git")):
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        git(root, "worktree", "prune")
+        r = git(root, "worktree", "add", "--detach", path, rm["branch"])
+        if r.returncode:
+            raise RuntimeError(f"git worktree add {path}: {r.stderr.strip()}")
+        log(d, f"slot {n}: worktree {path}")
+    ub = unit_branch(rm, uid)
+    # A slot left behind by a runner that died may still hold this branch.
+    for m in range(1, MAX_PARALLEL + 1):
+        other = slot_path(root, m)
+        if m != n and os.path.isdir(other) and current_branch(other) == ub:
+            release_slot(other, f"{rm['name']} {uid}")
+    stash = release_slot(path, f"{rm['name']} slot-{n}")
+    if stash:
+        log(d, f"slot {n}: leftover changes stashed as '{stash}'")
+    if branch_exists(root, ub):
+        r = git(path, "checkout", "-q", ub)
+    else:
+        r = git(path, "checkout", "-q", "-b", ub, rm["branch"])
+    if r.returncode:
+        raise RuntimeError(f"git checkout {ub} en {path}: {r.stderr.strip()}")
+    if not trust_slot(root, path):
+        raise RuntimeError(f"Claude Code no confía en {root} todavía: abrí `claude` ahí una vez y aceptá.")
+    return path
+
+
+def merge_unit(d, uid):
+    """Merge a closed unit's branch into the roadmap branch, without touching any worktree but the
+    repo's own checkout when that checkout is on the roadmap branch. Returns 'ok', 'conflict', or
+    an error text (try again later)."""
+    root = repo_of(d)
+    rm = load(d)
+    br, ub = rm["branch"], unit_branch(rm, uid)
+    u = get_unit(rm, uid)
+    if branch_exists(root, ub) and not is_ancestor(root, ub, br):
+        mt = git(root, "merge-tree", "--write-tree", br, ub)
+        if mt.returncode == 1:
+            return "conflict"
+        if mt.returncode:
+            return f"git merge-tree: {mt.stderr.strip()}"
+        msg = f"roadmap {rm['name']}: {uid} · {u['title']}"
+        if current_branch(root) == br:
+            r = git(root, "merge", "--no-ff", "--no-edit", "-m", msg, ub)
+            if r.returncode:
+                if git(root, "rev-parse", "-q", "--verify", "MERGE_HEAD").returncode == 0:
+                    git(root, "merge", "--abort")
+                return f"git merge en {root}: {(r.stderr or r.stdout).strip()}"
+        else:
+            old = git(root, "rev-parse", f"refs/heads/{br}").stdout.strip()
+            c = git(root, "commit-tree", mt.stdout.split()[0], "-p", old, "-p", ub, "-m", msg)
+            if c.returncode:
+                return f"git commit-tree: {c.stderr.strip()}"
+            r = git(root, "update-ref", f"refs/heads/{br}", c.stdout.strip(), old)
+            if r.returncode:
+                return f"git update-ref: {r.stderr.strip()}"
+    pm = None
+    with locked(d) as rm2:
+        u2 = get_unit(rm2, uid)
+        u2["merged_at"] = now()
+        pm = u2.pop("pending_merge", None)
+    for b in (ub, pm):
+        if b and b.startswith(f"roadmap/{rm['name']}/") and branch_exists(root, b) and is_ancestor(root, b, br):
+            git(root, "branch", "-D", b)
+    log(d, f"merged {uid} into {br}")
+    if rm.get("push"):
+        r = git(root, "push", "origin", br)
+        if r.returncode:
+            say(f"no pude hacer push de {br}: {r.stderr.strip()[-300:]}")
+            log(d, f"push {br} failed")
+    return "ok"
+
+
+# ---------------------------------------------------------------- terminals
+
+def pick_terminal(choice, parallel):
+    """Where sessions run. In parallel: fixed Warp tabs, one per slot, when the runner runs in Warp;
+    else a gnome-terminal window per session. One at a time: this terminal."""
+    choice = choice or os.environ.get("ROADMAP_TERMINAL")
+    if choice:
+        if choice not in TERMINALS:
+            fail(f"--terminal debe ser uno de {', '.join(TERMINALS)}")
+        return choice
+    if parallel > 1 and os.environ.get("TERM_PROGRAM") == "WarpTerminal" and shutil.which("xdg-open"):
+        return "warp"
+    if parallel > 1 and shutil.which("gnome-terminal"):
+        return "gnome-terminal"
+    return "inline"
+
+
+def toml_str(s):
+    return json.dumps(s, ensure_ascii=False)  # a JSON string is a valid TOML basic string
+
+
+def warp_tab_config(name, title, cwd, shell_cmd):
+    """A Warp tab config that runs one command. Warp opens it from warp://tab_config/<name>."""
+    os.makedirs(WARP_TAB_CONFIGS, exist_ok=True)
+    path = os.path.join(WARP_TAB_CONFIGS, f"{name}.toml")
+    with open(path, "w") as f:
+        f.write(f"name = {toml_str(name)}\ntitle = {toml_str(title)}\n\n[[panes]]\nid = \"main\"\n"
+                f"type = \"terminal\"\ndirectory = {toml_str(cwd)}\ncommands = [{toml_str(shell_cmd)}]\n")
+    return path
+
+
+def open_warp(name):
+    subprocess.Popen(["xdg-open", f"warp://tab_config/{name}"], stdin=subprocess.DEVNULL,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+
+
+def xdo(*args):
+    if not shutil.which("xdotool"):
+        return ""
+    try:
+        r = subprocess.run(["xdotool", *args], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
+def open_warp_tab(name, title, cwd, shell_cmd, give_back=True):
+    """Open a Warp tab and hand the keyboard back at once. Warp cannot open a tab in the background:
+    the new tab takes focus, and Warp types its command into the tab's input, where a stray key
+    breaks it. So wait until the tab is active (the window title becomes the tab's) and go back:
+    ctrl+PageUp when the user was in Warp (new tabs open after the current one), else re-activate
+    their window. Uses xdotool; Warp runs on XWayland."""
+    warp_tab_config(name, title, cwd, shell_cmd)
+    time.sleep(0.5)  # let Warp see the new file
+    before = xdo("getactivewindow")
+    in_warp = bool(before) and "warp" in xdo("getwindowclassname", before).lower()
+    open_warp(name)
+    if not give_back:
+        return
+    end = time.time() + 5
+    while time.time() < end:
+        w = xdo("getactivewindow")
+        if w and xdo("getwindowname", w) == title:
+            if in_warp:
+                xdo("key", "--clearmodifiers", "ctrl+Prior")
+            elif before:
+                xdo("windowactivate", before)
+            return
+        time.sleep(0.03)
+
+
+def open_window(title, cwd, argv):
+    """A gnome-terminal window running argv. It closes when argv ends."""
+    subprocess.Popen([shutil.which("gnome-terminal"), f"--working-directory={cwd}", "--title", title,
+                      "--", *argv], env=clean_env(), start_new_session=True,
+                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+def open_terminal(d, extra, term):
+    """/roadmap:execute: start the runner in a new tab or window, detached from this session."""
     root = repo_of(d)
     name = os.path.basename(d)
     cmd = " ".join(["python3", shlex.quote(THIS), "execute", shlex.quote(name)]
                    + (["--"] + [shlex.quote(x) for x in extra] if extra else []))
     cmd += "; echo; read -rp 'Enter cierra esta terminal. '"
-    term = shutil.which("gnome-terminal")
-    if not term:
-        fail(f"no encuentro gnome-terminal. Abrí una terminal y corré: cd {shlex.quote(root)} && roadmap execute {name}")
-    subprocess.Popen([term, f"--working-directory={root}", "--title", f"roadmap {name}", "--",
-                      "bash", "-lc", cmd], env=clean_env(), start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    if os.environ.get("TERM_PROGRAM") == "WarpTerminal":
+        cmd = f"rm -f {shlex.quote(os.path.join(WARP_TAB_CONFIGS, f'roadmap-{name}-runner.toml'))}; " + cmd
+    if os.environ.get("TERM_PROGRAM") == "WarpTerminal" and shutil.which("xdg-open"):
+        open_warp_tab(f"roadmap-{name}-runner", f"roadmap {name}", root, cmd, give_back=False)
+        out(f"Runner de '{name}' abierto en una pestaña nueva de Warp ({root}).")
+        return
+    if not shutil.which("gnome-terminal"):
+        fail(f"no encuentro Warp ni gnome-terminal. Abrí una terminal y corré: cd {shlex.quote(root)} && roadmap execute {name}")
+    open_window(f"roadmap {name}", root, ["bash", "-lc", cmd])
     out(f"Runner de '{name}' abierto en una terminal nueva ({root}).")
 
+
+# ---------------------------------------------------------------- the runner
 
 def wait_seconds(reset):
     try:
@@ -947,56 +1346,59 @@ def wait_seconds(reset):
     return int(min(600, max(60, left + 60)))
 
 
-def gate_usage(rm, u):
-    """Between sessions: wait out the 5-hour window, stop at the weekly or Fable limit."""
+def usage_gate(rm, u):
+    """Before a launch: None to go, ('wait', seconds, msg) for the 5-hour window, ('skip', msg) for
+    a Fable unit over the Fable limit, ('stop', msg) at the weekly limit."""
     lim = rm["limits"]
     model = str(u.get("model") or rm.get("default_model") or "").lower()
-    while True:
-        us = read_usage()
-        if not us:
-            say("no pude leer el uso de la cuenta; sigo igual.")
-            return
-        wk, fb, fh = us.get("weekly"), us.get("fable"), us.get("five_hour")
-        if wk and wk[0] >= lim["weekly"]:
-            die(f"uso semanal al {wk[0]:.0f}% (tope {lim['weekly']}%). Paro acá; se reinicia {when(wk[1])}.")
-        if fb and "fable" in model and fb[0] >= lim["fable"]:
-            die(f"la unidad {u['id']} usa Fable y el límite de Fable está al {fb[0]:.0f}% "
-                f"(tope {lim['fable']}%). Paro acá; se reinicia {when(fb[1])}. "
-                f"Para seguir con otro modelo: roadmap set {u['id']} model=opus")
-        if fh and fh[0] >= lim["five_hour"]:
-            say(f"ventana de 5 horas al {fh[0]:.0f}% (tope {lim['five_hour']}%). "
-                f"Espero al reinicio ({when(fh[1])}) y sigo. Ctrl+C para parar.")
-            time.sleep(wait_seconds(fh[1]))
-            continue
-        say(f"uso: {usage_line(us)}.")
-        return
+    us = read_usage()
+    if not us:
+        return None
+    wk, fb, fh = us.get("weekly"), us.get("fable"), us.get("five_hour")
+    if wk and wk[0] >= lim["weekly"]:
+        return ("stop", f"uso semanal al {wk[0]:.0f}% (tope {lim['weekly']}%). No lanzo más sesiones; "
+                        f"se reinicia {when(wk[1])}.")
+    if fb and "fable" in model and fb[0] >= lim["fable"]:
+        return ("skip", f"la unidad {u['id']} usa Fable y el límite de Fable está al {fb[0]:.0f}% "
+                        f"(tope {lim['fable']}%); no la lanzo. Se reinicia {when(fb[1])}. "
+                        f"Para hacerla con otro modelo: roadmap set {u['id']} model=opus")
+    if fh and fh[0] >= lim["five_hour"]:
+        return ("wait", wait_seconds(fh[1]), f"ventana de 5 horas al {fh[0]:.0f}% (tope {lim['five_hour']}%). "
+                                             f"No lanzo sesiones nuevas hasta el reinicio ({when(fh[1])}).")
+    say(f"uso: {usage_line(us)}.")
+    return None
 
 
-def idle_minutes(d):
+def read_pid(path):
     try:
-        return (time.time() - os.path.getmtime(run_file(d, "heartbeat"))) / 60
+        return int(open(path).read().strip())
+    except (OSError, ValueError):
+        return 0
+
+
+def pid_alive(pid, marker=None):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            cmd = f.read()
+    except OSError:
+        return False
+    return marker is None or marker.encode() in cmd.replace(b"\0", b" ")
+
+
+def worker_alive(d, uid):
+    pid = read_pid(unit_file(d, uid, "worker.pid"))
+    return bool(pid) and not os.path.exists(unit_file(d, uid, "exit.json")) and pid_alive(pid, "worker")
+
+
+def idle_minutes(d, uid):
+    try:
+        return (time.time() - os.path.getmtime(unit_file(d, uid, "heartbeat"))) / 60
     except OSError:
         return 0
 
 
-def finish(rm):
-    blocked = [u for u in rm["units"] if u["status"] == "blocked"]
-    if is_finished(rm):
-        die(f"roadmap {rm['name']} terminado: no queda nada pendiente.", 0)
-    lines = [f"no queda ninguna unidad que se pueda hacer sin vos. Bloqueadas: {len(blocked)}."]
-    for u in blocked:
-        lines.append(f"  {u['id']} · {(u.get('blocked') or {}).get('question', '')}")
-    lines.append("Abrí una sesión en este repo y corré /roadmap:attend; después, roadmap execute.")
-    die("\n".join(lines), 0)
-
-
 def record_session(d, uid, started, sig):
-    info = {}
-    try:
-        with open(run_file(d, "last-session.json")) as f:
-            info = json.load(f)
-    except (OSError, ValueError):
-        pass
+    info = read_json(unit_file(d, uid, "last-session.json"), {})
     try:
         with locked(d) as rm:
             u = get_unit(rm, uid)
@@ -1008,12 +1410,138 @@ def record_session(d, uid, started, sig):
         pass
 
 
+def cmd_worker(a):
+    """One session, in its own tab or window: setup commands, then claude, then exit.json. The
+    window closes when this ends. The hooks end the session by SIGTERM to this process's child."""
+    d, uid = a.dir, a.unit
+    spec = read_json(unit_file(d, uid, "launch.json"))
+    if not spec:
+        fail(f"no hay launch.json para {uid}")
+    with open(unit_file(d, uid, "worker.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    if spec.get("tab_config"):
+        rm_f(spec["tab_config"])
+    os.chdir(spec["cwd"])
+    sys.stdout.write(f"\033]0;{spec['title']}\007")
+    say(f"{spec['title']}\n           {spec['cwd']}")
+    env = clean_env()
+    env.update(spec["env"])
+    env["ROADMAP_RUNNER_PID"] = str(os.getpid())
+    env["CLAUDE_CODE_DISABLE_TERMINAL_TITLE"] = "1"  # the tab keeps the unit's title
+    result = {"started": now()}
+    # Ctrl+C belongs to the session. A Python-level handler (not SIG_IGN) keeps this process
+    # alive and is reset to the default on exec, so Claude Code still handles it.
+    signal.signal(signal.SIGINT, lambda *_: None)
+    setup_env = {key: v for key, v in env.items() if key != "ROADMAP_RUNNER"}
+    for line in spec.get("setup") or []:
+        say(f"setup: {line}")
+        r = subprocess.run(["bash", "-c", line], env=setup_env)
+        if r.returncode:
+            result.update(setup_failed=line, rc=r.returncode, ended=now())
+            write_json(unit_file(d, uid, "exit.json"), result)
+            say(f"el setup falló con código {r.returncode}. El runner no lanza más sesiones. "
+                "Esta pestaña se cierra en 10 minutos o con Enter.")
+            import select
+            select.select([sys.stdin], [], [], 600)
+            return
+    t0 = time.time()
+    p = subprocess.Popen(spec["cmd"], env=env)
+    with open(unit_file(d, uid, "claude.pid"), "w") as f:
+        f.write(str(p.pid))
+    rc = p.wait()
+    result.update(rc=rc, ended=now(), seconds=round(time.time() - t0))
+    write_json(unit_file(d, uid, "exit.json"), result)
+
+
+def slot_dir(d, n):
+    return os.path.join(run_dir(d), "slots", str(n))
+
+
+def runner_alive(d):
+    """The runner holds runner.lock for its whole life."""
+    try:
+        with open(run_file(d, "runner.lock"), "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(f, fcntl.LOCK_UN)
+        return False
+    except OSError:
+        return True
+
+
+def host_alive(d, n):
+    pid = read_pid(os.path.join(slot_dir(d, n), "host.pid"))
+    return bool(pid) and pid_alive(pid, " slot ")
+
+
+def cmd_slot(a):
+    """A fixed Warp tab of the runner: runs the sessions the runner assigns to slot n, one after
+    another, and closes when the runner ends. The runner opens these tabs once, at the start,
+    because Warp cannot open a tab without taking the keyboard."""
+    d, n = a.dir, a.n
+    sd = slot_dir(d, n)
+    os.makedirs(sd, exist_ok=True)
+    rm_f(os.path.join(sd, "quit"))
+    with open(os.path.join(sd, "host.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    name = os.path.basename(d.rstrip("/"))
+    rm_f(os.path.join(WARP_TAB_CONFIGS, f"roadmap-{name}-slot-{n}.toml"))
+    signal.signal(signal.SIGINT, lambda *_: None)  # Ctrl+C belongs to the session in this tab
+    idle = f"roadmap {name} · slot {n} · libre"
+
+    def title(t):
+        sys.stdout.write(f"\033]0;{t}\007")
+        sys.stdout.flush()
+
+    title(idle)
+    say(f"slot {n} de {name}: acá corren las unidades que el runner le asigna, una por vez.")
+    grace = time.time() + 60  # the runner may still be starting
+    try:
+        while True:
+            assign = os.path.join(sd, "assign")
+            uid = ""
+            try:
+                uid = open(assign).read().strip()
+            except OSError:
+                pass
+            if uid:
+                rm_f(assign)
+                subprocess.run(["python3", THIS, "worker", d, uid])
+                subprocess.run(["stty", "sane"], stderr=subprocess.DEVNULL)
+                title(idle)
+                say(f"slot {n} libre.")
+                continue
+            if os.path.exists(os.path.join(sd, "quit")) or (time.time() > grace and not runner_alive(d)):
+                break
+            time.sleep(1)
+    finally:
+        rm_f(os.path.join(sd, "host.pid"))
+
+
+def finish(rm, parked):
+    if is_finished(rm):
+        die(f"roadmap {rm['name']} terminado: no queda nada pendiente.", 0)
+    blocked = [u for u in rm["units"] if u["status"] == "blocked"]
+    lines = [f"no queda ninguna unidad que se pueda hacer ahora. Bloqueadas: {len(blocked)}."]
+    for u in blocked:
+        lines.append(f"  {u['id']} · {(u.get('blocked') or {}).get('question', '')}")
+    if parked:
+        lines.append(f"Sin relanzar en esta corrida: {', '.join(sorted(parked))} (ver arriba por qué).")
+    if blocked:
+        lines.append("Abrí una sesión en este repo y corré /roadmap:attend; después, roadmap execute.")
+    else:
+        lines.append("roadmap execute las retoma.")
+    die("\n".join(lines), 0)
+
+
 def cmd_execute(a):
     if os.environ.get("ROADMAP_RUNNER") == "1":
         fail("una sesión del runner no puede arrancar otro runner")
     d = resolve(rname(a))
+    rm = load(d)
+    par = int(rm.get("parallel") or 1)
+    term = pick_terminal(a.terminal, par)
     if a.new_terminal:
-        open_terminal(d, a.claude_args)
+        open_terminal(d, a.claude_args, term)
         return
     if os.environ.get("CLAUDECODE"):
         fail("roadmap execute corre en una terminal, no adentro de Claude. Desde Claude usá /roadmap:execute.")
@@ -1021,138 +1549,369 @@ def cmd_execute(a):
         fail("roadmap execute necesita una terminal interactiva")
     if not shutil.which("claude"):
         fail("no encuentro el comando claude en el PATH")
-    os.chdir(repo_of(d))
+    root = repo_of(d)
+    os.chdir(root)
     os.makedirs(run_dir(d), exist_ok=True)
     lockf = open(run_file(d, "runner.lock"), "w")
     try:
         fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         fail("ya hay un runner corriendo este roadmap")
-    name = load(d)["name"]
-    say(f"roadmap {name}. Ctrl+C durante una sesión le habla a esa sesión; "
-        "Ctrl+C en la pausa entre sesiones para el runner.")
-    last_unit, continues = None, 0
-    try:
-        while True:
-            rm = load(d)
-            bad = problems(rm, d)
-            if bad:
-                die("roadmap.json tiene problemas:\n  " + "\n  ".join(bad))
-            u = eligible(rm)
-            if not u:
-                finish(rm)
-            gate_usage(rm, u)
-            uid = u["id"]
-            with locked(d) as rm:
-                u = get_unit(rm, uid)
-                if u["status"] == "pending":
-                    u["status"] = "in_progress"
-                    u["started_at"] = now()
-                mode = rm["mode"]
-            for f in ("signal", "last-session.json"):
-                try:
-                    os.remove(run_file(d, f))
-                except OSError:
-                    pass
-            touch(run_file(d, "heartbeat"))
-            model = u.get("model") or rm["default_model"]
-            left = sum(1 for x in rm["units"] if x["status"] in ("pending", "in_progress"))
-            say(f"unidad {uid} · {u['title']} · {model} · modo {MODE_LABEL[mode]} · quedan {left}.")
-            log(d, f"start {uid} model={model} mode={mode}")
-            env = clean_env()
-            env.update(ROADMAP_RUNNER="1", ROADMAP_DIR=d, ROADMAP_UNIT=uid,
-                       ROADMAP_RUNNER_PID=str(os.getpid()))
-            cmd = ["claude", "--model", model] + permission_args(rm) + list(a.claude_args) \
-                + [f"/roadmap:session {name} {uid}"]
-            started, t0 = now(), time.time()
-            # Ctrl+C while a session runs belongs to that session. A Python-level handler (not
-            # SIG_IGN) keeps the runner alive and is reset to the default on exec, so Claude Code
-            # still handles it.
-            signal.signal(signal.SIGINT, lambda *_: None)
-            stalled = False
-            try:
-                p = subprocess.Popen(cmd, env=env)
-                while True:
-                    try:
-                        p.wait(timeout=30)
-                        break
-                    except subprocess.TimeoutExpired:
-                        pass
-                    if load(d).get("mode") == "unattended" and idle_minutes(d) >= IDLE_MINUTES:
-                        stalled = True
-                        log(d, f"stalled {uid}: {IDLE_MINUTES:.0f} min without activity")
-                        p.terminate()
-                        try:
-                            p.wait(timeout=20)
-                        except subprocess.TimeoutExpired:
-                            p.kill()
-                            p.wait()
-                        subprocess.run(["stty", "sane"], stderr=subprocess.DEVNULL)
-                        break
-            finally:
-                signal.signal(signal.SIGINT, signal.default_int_handler)
+    bad = problems(rm, d)
+    if bad:
+        die("roadmap.json tiene problemas:\n  " + "\n  ".join(bad))
+    name = rm["name"]
+    wt = worktrees(rm)  # fixed for the whole run: switching mid-run would strand unmerged branches
+    if wt:
+        ensure_branch(d)
+    inline = term == "inline"
+    where = {"warp": "en pestañas fijas de Warp, una por slot", "gnome-terminal": "una ventana por sesión",
+             "inline": "acá mismo, de a una"}[term]
+    if wt:
+        say(f"roadmap {name}: hasta {1 if inline else par} sesiones a la vez, {where}, cada una en su worktree; "
+            f"integro en {load(d)['branch']}. Ctrl+C acá deja de lanzar sesiones; dos veces, sale.")
+    else:
+        say(f"roadmap {name}: una sesión a la vez, {where}. "
+            + ("Ctrl+C durante una sesión le habla a esa sesión; Ctrl+C en la pausa entre sesiones para el runner."
+               if inline else "Ctrl+C acá deja de lanzar sesiones; dos veces, sale."))
 
-            sig = read_signal(d)
-            record_session(d, uid, started, sig)
-            try:
-                os.remove(run_file(d, "signal"))
-            except OSError:
-                pass
-            mode = load(d)["mode"]
-            lasted = time.time() - t0
-            if not sig and not stalled and lasted < QUICK_EXIT_SECONDS:
-                # A session that dies this fast never reached its unit: trust dialog answered
-                # "No", unknown model, not logged in. Retrying would only burn units.
-                die(f"la sesión terminó a los {lasted:.0f} s sin señal: no llegó a trabajar (¿diálogo de "
-                    f"confianza de la carpeta, modelo '{model}' inválido, login?). Paro. Abrí `claude` a mano "
-                    f"en {repo_of(d)} para ver el problema; la unidad {uid} queda en curso.")
-            if not sig:
-                if stalled:
-                    append_note(d, u, f"## Nota del runner\n\n{now()}: la sesión quedó {IDLE_MINUTES:.0f} minutos "
-                                      "sin actividad y el runner la cerró. Revisá `git status` antes de seguir.")
-                    sig = f"continue {uid}"
-                elif mode == "unattended":
-                    sig = f"continue {uid}"
-                    say("la sesión terminó sin señal. En modo desatendido la retomo en una sesión nueva.")
-                else:
-                    die(f"la sesión terminó sin señal (la cerraste vos, o se cortó). Paro. "
-                        f"La unidad {uid} queda en curso: roadmap execute la retoma.")
-            log(d, f"signal {sig}")
-            kind, _, sunit = sig.partition(" ")
-            sunit = sunit or uid
-            if kind == "next":
-                say(f"unidad {sunit} cerrada.")
-                last_unit, continues = None, 0
-            elif kind == "continue":
-                continues = continues + 1 if sunit == last_unit else 1
-                last_unit = sunit
-                if continues >= MAX_CONTINUES:
-                    q = (f"La unidad pasó a una sesión nueva {continues} veces seguidas sin terminar: está mal "
-                         "dimensionada o algo la traba. ¿La partimos (cómo) o qué falta?")
-                    if mode == "unattended":
-                        with locked(d) as rm:
-                            bu = get_unit(rm, sunit)
-                            bu["status"] = "blocked"
-                            bu["blocked"] = {"question": q, "since": now()}
-                        log(d, f"blocked {sunit}: {q}")
-                        say(f"la unidad {sunit} pidió seguir {continues} veces: la bloqueo y sigo con otra.")
-                        last_unit, continues = None, 0
-                    else:
-                        die(f"la unidad {sunit} pidió seguir {continues} veces seguidas. Paro: miralo a mano "
-                            f"(o partila con /roadmap:attend).")
-                else:
-                    say(f"la unidad {sunit} sigue en una sesión nueva ({continues} de {MAX_CONTINUES}).")
-            elif kind == "blocked":
-                say(f"la unidad {sunit} quedó bloqueada; sigo con la próxima que se pueda hacer.")
-                last_unit, continues = None, 0
+    running = {}       # uid -> {"slot", "started", "t0", "launched", "stalled", "killed"}
+    parked = set()     # units not relaunched in this run
+    continues = {}     # uid -> handoffs in a row in this run
+    state = {"stopping": None, "wait_until": 0.0, "waiting_said": False, "merge_retry": {},
+             "last_launch": 0.0, "ended": False, "seq": 0}
+
+    def stop(msg):
+        if not state["stopping"]:
+            state["stopping"] = msg
+            say(msg + (f" Espero las {len(running)} sesiones en curso." if running else ""))
+
+    # Sessions of a runner that died keep running in their tabs: adopt them, and process the
+    # ones that ended meanwhile.
+    for uid in sorted(os.listdir(os.path.join(run_dir(d), "units")) if os.path.isdir(os.path.join(run_dir(d), "units")) else []):
+        spec = read_json(unit_file(d, uid, "launch.json"))
+        if spec and (worker_alive(d, uid) or os.path.exists(unit_file(d, uid, "exit.json"))):
+            running[uid] = {"slot": spec.get("slot"), "started": spec.get("started"), "t0": spec.get("t0", time.time()),
+                            "launched": 0, "stalled": False, "killed": 0, "adopted": True}
+            say(f"retomo la sesión de {uid}, que ya estaba corriendo.")
+
+    def ended(uid, r):
+        """None while the session runs; else its exit info."""
+        info = read_json(unit_file(d, uid, "exit.json"))
+        if info:
+            return info
+        pid = read_pid(unit_file(d, uid, "worker.pid"))
+        if pid:
+            return None if pid_alive(pid, "worker") else {"rc": None, "gone": True}
+        if r["launched"] and time.time() - r["launched"] > LAUNCH_TIMEOUT_SECONDS:
+            return {"rc": None, "never_started": True}
+        return None
+
+    def watch_idle(uid, r):
+        if load(d).get("mode") != "unattended":
+            return
+        cpid = read_pid(unit_file(d, uid, "claude.pid"))
+        if not cpid or not pid_alive(cpid):
+            return
+        if r["killed"] and time.time() - r["killed"] > 20:
+            os.kill(cpid, signal.SIGKILL)
+        elif not r["killed"] and idle_minutes(d, uid) >= IDLE_MINUTES:
+            r["stalled"], r["killed"] = True, time.time()
+            log(d, f"stalled {uid}: {IDLE_MINUTES:.0f} min without activity")
+            say(f"la sesión de {uid} lleva {IDLE_MINUTES:.0f} minutos sin actividad: la cierro.")
+            os.kill(cpid, signal.SIGTERM)
+
+    def after(uid, r, info):
+        sig = read_signal(d, uid)
+        record_session(d, uid, r["started"], sig)
+        for f in ("signal", "exit.json", "worker.pid", "claude.pid", "launch.json"):
+            rm_f(unit_file(d, uid, f))
+        rm_ = load(d)
+        u = get_unit(rm_, uid)
+        if wt and r.get("slot"):
+            stash = release_slot(slot_path(root, r["slot"]), f"{name} {uid}")
+            if stash:
+                append_note(d, u, f"## Nota del runner\n\n{now()}: la sesión dejó cambios sin commitear. "
+                                  f"Quedaron en `git stash list` como \"{stash}\".")
+        if info.get("never_started"):
+            parked.add(uid)
+            stop(f"la sesión de {uid} no arrancó en {LAUNCH_TIMEOUT_SECONDS} s: ¿se abrió la pestaña? "
+                 "Probá con --terminal gnome-terminal o --terminal inline.")
+            return
+        if info.get("setup_failed"):
+            parked.add(uid)
+            stop(f"falló el setup del worktree ({info['setup_failed']}). Arreglalo con roadmap config setup=... "
+                 "y volvé a correr roadmap execute.")
+            return
+        mode = rm_["mode"]
+        lasted = info.get("seconds") if info.get("seconds") is not None else time.time() - r["t0"]
+        if not sig and not r["stalled"] and not r.get("adopted") and lasted < QUICK_EXIT_SECONDS:
+            # A session that dies this fast never reached its unit: trust dialog answered "No",
+            # unknown model, not logged in. Relaunching would only burn units.
+            parked.add(uid)
+            stop(f"la sesión de {uid} terminó a los {lasted:.0f} s sin señal: no llegó a trabajar (¿diálogo de "
+                 f"confianza de la carpeta, modelo '{u.get('model')}' inválido, login?). Abrí `claude` a mano "
+                 f"en {slot_path(root, r['slot']) if wt and r.get('slot') else root} para ver el problema.")
+            return
+        if not sig:
+            if r["stalled"]:
+                append_note(d, u, f"## Nota del runner\n\n{now()}: la sesión quedó {IDLE_MINUTES:.0f} minutos "
+                                  "sin actividad y el runner la cerró. Revisá `git status` antes de seguir.")
+                sig = f"continue {uid}"
+            elif mode == "unattended":
+                sig = f"continue {uid}"
+                say(f"la sesión de {uid} terminó sin señal. En modo desatendido la retomo en una sesión nueva.")
             else:
-                die(f"señal desconocida: '{sig}'.")
+                parked.add(uid)
+                say(f"la sesión de {uid} terminó sin señal (la cerraste vos, o se cortó). No la relanzo en esta "
+                    "corrida; queda en curso y el próximo roadmap execute la retoma.")
+                return
+        log(d, f"signal {sig}")
+        kind, _, sunit = sig.partition(" ")
+        sunit = sunit or uid
+        if kind == "next":
+            say(f"unidad {sunit} cerrada.")
+            continues.pop(sunit, None)
+        elif kind == "continue":
+            continues[sunit] = continues.get(sunit, 0) + 1
+            n = continues[sunit]
+            if n >= MAX_CONTINUES:
+                q = (f"La unidad pasó a una sesión nueva {n} veces seguidas sin terminar: está mal "
+                     "dimensionada o algo la traba. ¿La partimos (cómo) o qué falta?")
+                if mode == "unattended":
+                    with locked(d) as rm2:
+                        bu = get_unit(rm2, sunit)
+                        bu["status"] = "blocked"
+                        bu["blocked"] = {"question": q, "since": now()}
+                    log(d, f"blocked {sunit}: {q}")
+                    say(f"la unidad {sunit} pidió seguir {n} veces: la bloqueo y sigo con otras.")
+                    continues.pop(sunit, None)
+                else:
+                    parked.add(sunit)
+                    say(f"la unidad {sunit} pidió seguir {n} veces seguidas. No la relanzo: miralo a mano "
+                        f"(o partila con /roadmap:attend).")
+            else:
+                say(f"la unidad {sunit} sigue en una sesión nueva ({n} de {MAX_CONTINUES}).")
+        elif kind == "blocked":
+            say(f"la unidad {sunit} quedó bloqueada; sigo con las que no dependen de ella.")
+            continues.pop(sunit, None)
+        else:
+            stop(f"señal desconocida de {uid}: '{sig}'.")
 
-            pause = UNATTENDED_PAUSE_SECONDS if mode == "unattended" else PAUSE_SECONDS
-            say(f"la próxima sesión arranca en {pause} s. Ctrl+C para parar acá.")
-            time.sleep(pause)
-    except KeyboardInterrupt:
-        die("parado a pedido.", 0)
+    def merges():
+        """Merge every closed unit not merged yet. A conflict goes back to a session: the unit
+        itself (done), or its first child (split)."""
+        rm_ = load(d)
+        for u in rm_["units"]:
+            uid = u["id"]
+            if u["status"] not in ("done", "split") or u.get("merged_at") or uid in running:
+                continue
+            if time.time() < state["merge_retry"].get(uid, 0):
+                continue
+            res = merge_unit(d, uid)
+            if res == "ok":
+                say(f"unidad {uid} integrada en {rm_['branch']}.")
+                state["merge_retry"].pop(uid, None)
+            elif res == "conflict":
+                ub, br = unit_branch(rm_, uid), rm_["branch"]
+                with locked(d) as rm2:
+                    u2 = get_unit(rm2, uid)
+                    if u2["status"] == "done":
+                        u2["status"] = "in_progress"
+                        u2["pending_merge"] = br
+                        target, other = u2, br
+                    else:
+                        u2["merged_at"] = now()  # its work reaches the branch through its first child
+                        target = get_unit(rm2, u2["children"][0])
+                        target["pending_merge"] = ub
+                        other = ub
+                append_note(d, target, f"## Nota del runner\n\n{now()}: el merge de `{ub}` en `{br}` tuvo "
+                                       f"conflictos. Antes de seguir, en el worktree: `git merge {other}`, "
+                                       "resolvé los conflictos respetando lo que quiso cada lado, verificá, "
+                                       f"commiteá y cerrá la unidad como siempre.")
+                log(d, f"merge conflict {uid}: {target['id']} merges {other}")
+                say(f"el merge de {uid} chocó con {br}: lo resuelve una sesión de {target['id']}.")
+            else:
+                state["merge_retry"][uid] = time.time() + 60
+                say(f"no pude integrar {uid} todavía ({res[:300]}). Reintento en un minuto.")
+                log(d, f"merge {uid} failed: {res}")
+
+    def launch(u, slot):
+        uid = u["id"]
+        with locked(d) as rm2:
+            u = get_unit(rm2, uid)
+            if u["status"] == "pending":
+                u["status"] = "in_progress"
+                u["started_at"] = now()
+            mode = rm2["mode"]
+            model = u.get("model") or rm2["default_model"]
+            rm_ = json.loads(json.dumps(rm2))
+        os.makedirs(unit_run(d, uid), exist_ok=True)
+        for f in ("signal", "signal.tmp", "last-session.json", "exit.json", "worker.pid", "claude.pid"):
+            rm_f(unit_file(d, uid, f))
+        touch(unit_file(d, uid, "heartbeat"))
+        cwd = root
+        env = {"ROADMAP_RUNNER": "1", "ROADMAP_DIR": d, "ROADMAP_UNIT": uid, "ROADMAP_REPO": root}
+        if wt:
+            try:
+                cwd = prepare_slot(d, rm_, slot, uid)
+            except RuntimeError as e:
+                parked.add(uid)
+                stop(f"no pude preparar el worktree de {uid}: {e}")
+                return
+            env["ROADMAP_WORKTREE"] = cwd
+        title = f"{uid} · {u['title']}"
+        spec = {"cmd": ["claude", "--model", model] + permission_args(rm_) + list(a.claude_args)
+                       + [f"/roadmap:session {name} {uid}"],
+                "cwd": cwd, "env": env, "setup": rm_.get("setup") or [] if wt else [],
+                "title": f"roadmap {name} · {title}", "slot": slot, "started": now(), "t0": time.time()}
+        write_json(unit_file(d, uid, "launch.json"), spec)
+        left = sum(1 for x in rm_["units"] if x["status"] in ("pending", "in_progress"))
+        say(f"unidad {uid} · {u['title']} · {model} · modo {MODE_LABEL[mode]}"
+            + (f" · slot {slot}" if wt else "") + f" · quedan {left}.")
+        log(d, f"start {uid} model={model} mode={mode}" + (f" slot={slot}" if wt else ""))
+        r = {"slot": slot, "started": spec["started"], "t0": spec["t0"], "launched": time.time(),
+             "stalled": False, "killed": 0}
+        running[uid] = r
+        state["last_launch"] = time.time()
+        state["ran_inline"] = inline
+        argv = ["python3", THIS, "worker", d, uid]
+        if term == "warp":
+            if not ensure_host(slot):
+                del running[uid]
+                parked.add(uid)
+                stop(f"no pude abrir la pestaña del slot {slot}. Probá con --terminal gnome-terminal.")
+                return
+            with open(os.path.join(slot_dir(d, slot), "assign.tmp"), "w") as f:
+                f.write(uid)
+            os.replace(os.path.join(slot_dir(d, slot), "assign.tmp"), os.path.join(slot_dir(d, slot), "assign"))
+            return
+        if term == "gnome-terminal":
+            open_window(spec["title"], cwd, argv)
+            return
+        signal.signal(signal.SIGINT, lambda *_: None)
+        try:
+            p = subprocess.Popen(argv, cwd=cwd)
+            while True:
+                try:
+                    p.wait(timeout=30)
+                    break
+                except subprocess.TimeoutExpired:
+                    watch_idle(uid, r)
+        finally:
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+        if r["stalled"]:
+            subprocess.run(["stty", "sane"], stderr=subprocess.DEVNULL)
+
+    def ensure_host(n):
+        """The fixed tab of slot n is running; open it if not. A key typed while Warp writes the
+        tab's command breaks it, so a tab that does not start is opened once more."""
+        cmd = "exec " + " ".join(shlex.quote(x) for x in ["python3", THIS, "slot", d, str(n)])
+        for attempt in (1, 2):
+            if host_alive(d, n):
+                return True
+            if attempt == 2:
+                say(f"la pestaña del slot {n} no arrancó (¿una tecla rompió su comando? cerrala): abro otra.")
+            open_warp_tab(f"roadmap-{name}-slot-{n}", f"roadmap {name} · slot {n}", root, cmd)
+            end = time.time() + 20
+            while time.time() < end:
+                if host_alive(d, n):
+                    return True
+                time.sleep(0.5)
+        return False
+
+    def launch_more():
+        rm_ = load(d)
+        bad = problems(rm_, d)
+        if bad:
+            stop("roadmap.json tiene problemas; no lanzo más sesiones:\n  " + "\n  ".join(bad))
+            return
+        slots = 1 if inline or not wt else int(rm_.get("parallel") or 1)
+        if time.time() < state["wait_until"]:
+            return
+        while len(running) < slots and not state["stopping"]:
+            cands = [u for u in ready(rm_, running) if u["id"] not in parked]
+            if not cands:
+                return
+            u = cands[0]
+            g = usage_gate(rm_, u)
+            if g and g[0] == "stop":
+                stop(g[1])
+                return
+            if g and g[0] == "skip":
+                parked.add(u["id"])
+                say(g[1])
+                continue
+            if g and g[0] == "wait":
+                state["wait_until"] = time.time() + g[1]
+                say(g[2])
+                return
+            if inline and state["ended"]:
+                pause = UNATTENDED_PAUSE_SECONDS if rm_["mode"] == "unattended" else PAUSE_SECONDS
+                say(f"la próxima sesión arranca en {pause} s. Ctrl+C para parar acá.")
+                time.sleep(pause)
+            gap = STAGGER_SECONDS - (time.time() - state["last_launch"])
+            if gap > 0:
+                time.sleep(gap)
+            used = {r["slot"] for r in running.values()}
+            launch(u, min(n for n in range(1, MAX_PARALLEL + 1) if n not in used))
+            if inline:
+                return
+            rm_ = load(d)
+
+    def step():
+        for uid, r in list(running.items()):
+            info = ended(uid, r)
+            if info is None:
+                watch_idle(uid, r)
+                continue
+            del running[uid]
+            state["ended"] = True
+            after(uid, r, info)
+        if wt:
+            merges()
+        if not state["stopping"]:
+            launch_more()
+        if not running:
+            if state["stopping"]:
+                die(state["stopping"])
+            rm_ = load(d)
+            waiting = time.time() < state["wait_until"]
+            unmerged = wt and any(u["status"] in ("done", "split") and not u.get("merged_at") for u in rm_["units"])
+            if not waiting and not unmerged and not [u for u in ready(rm_) if u["id"] not in parked]:
+                finish(rm_, parked)
+        if not state.pop("ran_inline", False):
+            time.sleep(POLL_SECONDS)
+
+    def loop():
+        while True:
+            try:
+                step()
+            except KeyboardInterrupt:
+                if inline or not running:
+                    die("parado a pedido.", 0)
+                if state["stopping"] == "parado a pedido.":
+                    die(f"salgo. Quedan {len(running)} sesiones en sus pestañas: terminan solas, y el próximo "
+                        "roadmap execute integra lo que cierren.", 0)
+                state["stopping"] = None
+                stop("parado a pedido.")
+                say("Ctrl+C otra vez para salir ya.")
+
+    if term == "warp":
+        for n in range(1, MAX_PARALLEL + 1):
+            rm_f(os.path.join(slot_dir(d, n), "quit"))
+        say(f"abro {par} pestañas, una por slot. No escribas hasta que terminen de abrirse.")
+        for n in range(par, 0, -1):  # new tabs open after the current one: last slot first
+            if not ensure_host(n):
+                die(f"no pude abrir la pestaña del slot {n}. Probá con --terminal gnome-terminal.")
+        say("pestañas listas.")
+    try:
+        loop()
+    finally:
+        if term == "warp":
+            for n in range(1, MAX_PARALLEL + 1):
+                if os.path.isdir(slot_dir(d, n)):
+                    touch(os.path.join(slot_dir(d, n), "quit"))
 
 
 # ---------------------------------------------------------------- hooks
@@ -1195,8 +1954,7 @@ def remember_session(d, inp):
     tp = inp.get("transcript_path")
     info = {"session_id": inp.get("session_id"), "transcript_path": tp,
             "context_first": context_tokens(tp, first=True), "context_last": context_tokens(tp)}
-    with open(run_file(d, "last-session.json"), "w") as f:
-        json.dump(info, f)
+    write_json(unit_file(d, hook_unit(), "last-session.json"), info)
 
 
 def hook_pre_tool(d, inp):
@@ -1232,7 +1990,7 @@ def context_message(level, used, limit, unit):
 
 
 def hook_post_tool(d, inp):
-    touch(run_file(d, "heartbeat"))
+    touch(unit_file(d, hook_unit(), "heartbeat"))
     limit = int(load(d).get("context_limit") or DEFAULT_CONTEXT_LIMIT)
     used = context_tokens(inp.get("transcript_path"))
     if not used:
@@ -1261,8 +2019,16 @@ def hook_post_tool(d, inp):
 
 
 def hook_stop(d, inp):
-    touch(run_file(d, "heartbeat"))
-    if read_signal(d):
+    touch(unit_file(d, hook_unit(), "heartbeat"))
+    if read_signal(d, hook_unit()):
+        remember_session(d, inp)
+        end_session()
+        return
+    # The unit is closed but its signal is missing (a CLI from another plugin version, a hand
+    # edit): the state in roadmap.json decides.
+    u = by_id(load(d)).get(hook_unit())
+    if u and u.get("status") in ("done", "split", "blocked"):
+        write_signal(d, "blocked" if u["status"] == "blocked" else "next", u["id"])
         remember_session(d, inp)
         end_session()
         return
@@ -1328,12 +2094,16 @@ def main():
     p = add("execute", cmd_execute, "correr el roadmap: una sesión interactiva por unidad", roadmap=False)
     p.add_argument("roadmap", nargs="?")
     p.add_argument("--new-terminal", action="store_true", help="abrir el runner en una terminal nueva")
+    p.add_argument("--terminal", choices=TERMINALS,
+                   help="dónde abrir las sesiones (por defecto: Warp si corrés en Warp; si no, gnome-terminal en paralelo o acá)")
     p.epilog = "Argumentos extra para claude van después de --, por ejemplo: roadmap execute -- --plugin-dir ~/x"
     add("status", cmd_status, "estado de las unidades").add_argument("name", nargs="?")
     add("list", cmd_list, "roadmaps de este repo", roadmap=False)
     add("usage", cmd_usage, "uso de la cuenta (5 horas, semanal, Fable)", roadmap=False)
     add("attend", lambda a: set_mode(a, "attended"), "modo atendido").add_argument("name", nargs="?")
     add("unattend", lambda a: set_mode(a, "unattended"), "modo desatendido").add_argument("name", nargs="?")
+    p = add("config", cmd_config, "ver o cambiar opciones del roadmap (parallel, branch, push, setup, ...)")
+    p.add_argument("pairs", nargs="*")
     add("install-cli", cmd_install_cli, "instalar el comando roadmap en ~/.local/bin", roadmap=False)
     add("baseline", cmd_baseline, "contexto fijo estimado de una sesión en este repo", roadmap=False)
     p = add("init", cmd_init, "crear un roadmap vacío", roadmap=False)
@@ -1360,6 +2130,12 @@ def main():
     p = add("set", cmd_set, "cambiar campos de una unidad (clave=valor)")
     p.add_argument("unit")
     p.add_argument("pairs", nargs="+")
+    p = add("worker", cmd_worker, "uso interno del runner: una sesión en su pestaña", roadmap=False)
+    p.add_argument("dir")
+    p.add_argument("unit")
+    p = add("slot", cmd_slot, "uso interno del runner: la pestaña fija de un slot", roadmap=False)
+    p.add_argument("dir")
+    p.add_argument("n", type=int)
     p = add("hook", cmd_hook, "entrada de los hooks del plugin", roadmap=False)
     p.add_argument("event", choices=("pre-tool", "post-tool", "stop"))
 

@@ -18,8 +18,8 @@ Context (computed, do not recompute):
 
 ## What you are building
 
-A roadmap is a list of **units** that a runner (`roadmap execute`) does one per session. Each
-session starts from zero context, gets `ROADMAP.md` and its own unit file, does the unit, and
+A roadmap is a list of **units** that a runner (`roadmap execute`) does one per session, several
+at a time when the units allow it. Each session starts from zero context, gets `ROADMAP.md` and its own unit file, does the unit, and
 closes it. Nobody carries context between sessions except these files and the commits.
 
 **The goal of this planning session: the run must never need the user.** Every question a
@@ -43,17 +43,34 @@ Files, in `<repo>/.claude/roadmaps/<name>/` (kept out of git through `.git/info/
   "mode": "attended", "permission_mode": "bypass", "context_limit": 150000,
   "limits": {"five_hour": 95, "weekly": 70, "fable": 90},
   "default_model": "opus", "documentador": null,
+  "parallel": 3, "branch": "feature/auth-rework", "push": false,
+  "setup": ["cp \"$ROADMAP_REPO/.env\" .", "[ -d node_modules ] || npm ci"],
   "units": [
     {"id": "01", "title": "…", "file": "units/01-slug.md", "model": "opus",
-     "est_tokens": 70000, "depends_on": [], "status": "pending", "task": null}
+     "est_tokens": 70000, "depends_on": [], "touches": ["lib/auth/", "pubspec.yaml"],
+     "status": "pending", "task": null}
   ]
 }
 ```
 
-- `id`: short, ordered (`01`, `02a`, `02b`). **The order of `units` is the order of execution**; a
-  session takes the first pending unit whose `depends_on` are done.
+- `id`: short, ordered (`01`, `02a`, `02b`). **The order of `units` is the priority**: the runner
+  starts the first units whose `depends_on` are met, up to `parallel` at a time.
 - `depends_on`: unit IDs, or `["*"]` for a unit that runs after every other unit is done or
-  blocked (a deferred full test run, for example). At most one such unit.
+  blocked (a deferred full test run, for example). At most one such unit. **Only real
+  dependencies**: a unit that needs another's code, schema or decisions. Every extra
+  dependency serializes the run; every missing one lets a unit start without what it needs.
+- `touches`: paths (files or directories, no globs) the unit will edit. The runner never runs two
+  units at once that share a path, so they cannot conflict. Shared hot files (a routes table, a
+  DI container, `pubspec.yaml`, `package.json`, a migrations folder) belong here.
+- `parallel`: sessions at the same time. `1` runs one unit at a time in the repo's own checkout,
+  as a plain chain. `2` or more gives each session its own git worktree and branch
+  (`roadmap/<name>/<unit>`), and the runner merges each closed unit into `branch`.
+- `branch`: the branch units merge into (parallel) or work on (parallel 1). `push`: whether the
+  runner pushes `branch` after each merge.
+- `setup`: shell commands each worktree runs before its session (parallel only), in the
+  worktree, with `$ROADMAP_REPO` set to the repo. A worktree has the committed files only:
+  copy the ignored ones the work needs (`.env`, local config) and install dependencies. Worktrees
+  are reused across units, so make the commands idempotent.
 - `model`: `opus`, `sonnet`, `haiku`, `fable`, or a full model ID.
 - `est_tokens`: your estimate of the context the unit's session reaches.
 - `task`: documentador task ID, or `null`.
@@ -64,7 +81,8 @@ Files, in `<repo>/.claude/roadmaps/<name>/` (kept out of git through `.git/info/
 
 Take the tasks from the request. If there are none, ask the user to list them all, in their
 own words, and wait. Pick a short kebab-case name for the roadmap and confirm it with the
-title.
+title. The name must not be one of the roadmaps listed above, finished or not: `roadmap init`
+refuses an existing name, and a finished roadmap stays as the record of that run.
 
 ### 2. Understand enough to size and to find the decisions
 
@@ -119,14 +137,33 @@ rounds as needed. Group by theme. Open questions (names, texts, criteria) go in 
 **Readiness test.** For each unit, ask yourself: *could a fresh session with only `ROADMAP.md`
 and this unit file do it without asking anything?* If not, ask more.
 
-### 5. Models
+### 5. Parallelism
+
+Draw the dependency graph from the units: what needs whose code, schema or decisions. Then
+the paths each unit edits, for `touches`. Show the user the graph as waves (wave 1: units with
+no dependencies; wave 2: units that only need wave 1; …) and ask, in one `AskUserQuestion`
+call:
+
+- **Parallel sessions.** Recommend `3` when the first wave has three or more units, else the
+  width of the widest wave (`1` when the graph is a chain). More sessions finish sooner but
+  spend the plan limits faster, and each session in attended mode may ask questions at the
+  same time.
+- **Worktree setup** (only when `parallel` > 1): what a fresh checkout of this repo needs before
+  it builds and tests. Propose the commands from what you saw (ignored env files, dependency
+  install, code generation) and let the user correct them.
+
+When `parallel` > 1, "Branch" in the interview becomes the branch units merge into, and the
+rules in `ROADMAP.md` must not tell sessions to switch branches, merge, or push: the runner
+does that (`push` in `roadmap.json`).
+
+### 6. Models
 
 The default is `opus` for every unit. Suggest another model only where it clearly fits:
 `sonnet` for mechanical work (renames, doc sweeps, config); `fable` for the hardest units
 (architecture, deep debugging), noting that they consume the Fable limit. Put the suggestions in
 one question and let the user confirm or change them.
 
-### 6. Limits
+### 7. Limits
 
 Show the account usage above. Ask for the three limits in one `AskUserQuestion` call, with
 these recommended values first:
@@ -140,7 +177,7 @@ The context limit per session is 150k tokens unless the user says otherwise. Ses
 with `--dangerously-skip-permissions` (`"permission_mode": "bypass"`), which unattended runs
 need. Mention both in the final summary; ask only if the user brings them up.
 
-### 7. Documentador: only when the user asked for it
+### 8. Documentador: only when the user asked for it
 
 Use the documentador **only if the user explicitly asked, in this conversation**, to create the
 tasks there. Otherwise do not create tasks, and do not offer to. If they asked:
@@ -151,7 +188,7 @@ tasks there. Otherwise do not create tasks, and do not offer to. If they asked:
 - Set `"documentador": {"project_id": <id>}` in `roadmap.json` and each unit's `"task"`. If
   the user wants the tasks assigned to someone, write that in `ROADMAP.md`.
 
-### 8. Write the roadmap
+### 9. Write the roadmap
 
 1. If the CLI is missing, run the `install-cli` command shown above.
 2. `roadmap init <name> --title "<title>"`.
@@ -159,17 +196,22 @@ tasks there. Otherwise do not create tasks, and do not offer to. If they asked:
 4. Write one unit file per unit from the template. "Leer antes" names concrete paths: it
    replaces exploration. "Decisiones" carries the answers in full: do not point to this
    conversation, the session will never see it.
-5. Fill `units` in `roadmap.json`.
-6. `roadmap validate`, and fix until it passes. Then `roadmap status`.
+5. Fill `units` in `roadmap.json`, with `depends_on` and `touches`, and set `parallel`, `branch`,
+   `push` and `setup`.
+6. `roadmap validate <name>`, and fix until it passes. Then `roadmap status <name>`.
 
-### 9. Hand over
+Always pass `<name>` to the CLI in this session: the repo may hold other roadmaps, and without
+a name the CLI may pick another one or refuse to choose.
 
-Show the `roadmap status` table and one line with the limits. Then tell the user, in their
-language:
+### 10. Hand over
 
-- The plan is ready. Close this session and run `roadmap execute` in `<repo>` (or
-  `/roadmap:execute` to open it in a new terminal).
-- If they will not be around: `roadmap unattend` before starting, or `/roadmap:unattend` in the
-  running session. `/roadmap:attend` later answers whatever got blocked.
+Show the `roadmap status <name>` table, the waves, and one line with the limits. Then tell the user, in
+their language:
+
+- The plan is ready. Close this session and run `roadmap execute <name>` in `<repo>` (or
+  `/roadmap:execute <name>` to open it in a new terminal). With `parallel` > 1 in Warp, the
+  runner opens one fixed tab per session slot next to its own, once, at the start.
+- If they will not be around: `roadmap unattend <name>` before starting, or `/roadmap:unattend`
+  in the running session. `/roadmap:attend` later answers whatever got blocked.
 
 Do not start executing units in this session.
