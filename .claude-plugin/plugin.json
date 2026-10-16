@@ -1,7 +1,7 @@
 {
   "name": "roadmap",
   "displayName": "Roadmap",
-  "version": "0.2.0",
+  "version": "0.2.2",
   "description": "Plan a batch of tasks as a roadmap of session-sized units, then run it as fresh interactive sessions, in parallel where the dependency graph allows (worktree per session, fixed Warp tabs): a model per unit, usage limits checked between sessions, context-size awareness inside each one, and an unattended mode that blocks what needs you instead of waiting.",
   "author": { "name": "Shlomo Serber", "url": "https://github.com/ShlomoSerber" },
   "repository": "https://github.com/ShlomoSerber/claude_code_roadmap_plugin",

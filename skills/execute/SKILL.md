@@ -22,7 +22,9 @@ opens it in a new Warp tab (when this session runs in Warp) or a new `gnome-term
 3. If the status shows no unit left to do, say so and stop. If the only units left are
    blocked, suggest `/roadmap:attend` and stop.
 4. Run `"${CLAUDE_PLUGIN_ROOT}/bin/roadmap" execute <name> --new-terminal`, with the roadmap name
-   from the arguments if given. Pass extra claude arguments after `--`.
+   from the arguments if given. Pass extra claude arguments after `--`. It waits until the runner
+   starts (up to 30 s). If it fails, show its message and the command to run by hand:
+   `cd <repo> && roadmap execute <name>`.
 5. Tell the user, in their language, in three lines at most: the runner is open in a new tab or
    window; each unit runs in its own session with the model of the unit and with permissions
    skipped (with parallel > 1, in fixed tabs the runner opens next to its own, each session in its

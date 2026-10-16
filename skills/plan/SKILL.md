@@ -169,7 +169,8 @@ Show the account usage above. Ask for the three limits in one `AskUserQuestion` 
 these recommended values first:
 
 - **5 horas: 95%.** At this level the runner waits for the window to reset, then continues.
-- **Semanal: 70%.** At this level the runner stops.
+- **Semanal: 70%.** At this level the runner stops. If the user wants it to wait for the weekly
+  reset instead, set `"weekly_action": "wait"` in `limits`.
 - **Fable: 90%.** The runner stops before a Fable unit at this level. It only matters if some
   unit uses Fable.
 

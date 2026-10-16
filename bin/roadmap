@@ -39,6 +39,7 @@ MODES = ("attended", "unattended")
 MODE_LABEL = {"attended": "atendido", "unattended": "desatendido"}
 PERMISSION_MODES = ("bypass", "auto", "acceptEdits", "default")
 DEFAULT_LIMITS = {"five_hour": 95, "weekly": 70, "fable": 90}
+WEEKLY_ACTIONS = ("stop", "wait")   # limits.weekly_action: what the runner does at the weekly limit
 DEFAULT_CONTEXT_LIMIT = 150000
 ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
@@ -49,6 +50,7 @@ MAX_CONTINUES = int(os.environ.get("ROADMAP_MAX_CONTINUES", "3"))
 IDLE_MINUTES = float(os.environ.get("ROADMAP_IDLE_MINUTES", "30"))
 MAX_PARALLEL = 8
 LAUNCH_TIMEOUT_SECONDS = 90          # a launched tab or window whose worker never starts
+RUNNER_START_SECONDS = 30            # --new-terminal: wait this long for the runner to start
 POLL_SECONDS = 2
 STAGGER_SECONDS = 3                  # between two launches, so tabs open in order
 TERMINALS = ("warp", "gnome-terminal", "inline")
@@ -78,7 +80,14 @@ def out(msg=""):
     print(msg, flush=True)
 
 
+# The runner's roadmap dir, once cmd_execute knows it: fail() and die() also write why the runner
+# ended to runner.log, so the reason survives the closed tab.
+RUNNER_DIR = None
+
+
 def fail(msg, code=1):
+    if RUNNER_DIR:
+        log(RUNNER_DIR, f"exit: {msg}")
     print(f"roadmap: {msg}", file=sys.stderr, flush=True)
     sys.exit(code)
 
@@ -88,6 +97,8 @@ def say(msg):
 
 
 def die(msg, code=1):
+    if RUNNER_DIR:
+        log(RUNNER_DIR, f"exit: {msg}")
     say(msg)
     sys.exit(code)
 
@@ -413,6 +424,8 @@ def problems(rm, d):
             v = lim.get(key)
             if not isinstance(v, int) or not 1 <= v <= 100:
                 p.append(f"limits.{key} debe ser un entero entre 1 y 100")
+        if lim.get("weekly_action", "stop") not in WEEKLY_ACTIONS:
+            p.append(f"limits.weekly_action debe ser uno de {WEEKLY_ACTIONS}")
     if not str(rm.get("default_model", "")).strip():
         p.append("falta default_model")
     doc = rm.get("documentador")
@@ -947,7 +960,8 @@ def cmd_status(a):
     rm = load(d)
     lim = rm.get("limits", {})
     out(f"Roadmap {rm['name']} · {rm['title']}  [modo {MODE_LABEL.get(rm['mode'], rm['mode'])}]")
-    out(f"Topes: 5 horas {lim.get('five_hour')}% (espera) · semanal {lim.get('weekly')}% (para) · "
+    wk_act = "espera" if lim.get("weekly_action") == "wait" else "para"
+    out(f"Topes: 5 horas {lim.get('five_hour')}% (espera) · semanal {lim.get('weekly')}% ({wk_act}) · "
         f"Fable {lim.get('fable')}% (para) · contexto {k(rm.get('context_limit', 0))} por sesión")
     if worktrees(rm):
         out(f"En paralelo: hasta {rm['parallel']} sesiones, cada una en su worktree; integra en "
@@ -1003,7 +1017,8 @@ def set_mode(a, mode):
             "hace una pausa de 15 s entre sesiones.")
 
 
-CONFIG_KEYS = ("parallel", "branch", "push", "setup", "context_limit", "permission_mode", "default_model")
+CONFIG_KEYS = ("parallel", "branch", "push", "setup", "context_limit", "permission_mode", "default_model",
+               "limits.five_hour", "limits.weekly", "limits.weekly_action", "limits.fable")
 
 
 def cmd_config(a):
@@ -1011,7 +1026,11 @@ def cmd_config(a):
     if not a.pairs:
         rm = load(d)
         for key in CONFIG_KEYS:
-            out(f"{key} = {json.dumps(rm.get(key), ensure_ascii=False)}")
+            if key.startswith("limits."):
+                val = (rm.get("limits") or {}).get(key[7:], "stop" if key == "limits.weekly_action" else None)
+            else:
+                val = rm.get(key)
+            out(f"{key} = {json.dumps(val, ensure_ascii=False)}")
         return
     with locked(d) as rm:
         for pair in a.pairs:
@@ -1020,6 +1039,9 @@ def cmd_config(a):
             key, val = pair.split("=", 1)
             if key not in CONFIG_KEYS:
                 fail(f"'{key}' no se puede cambiar; se puede: {', '.join(CONFIG_KEYS)}")
+            if key.startswith("limits."):
+                rm.setdefault("limits", {})[key[7:]] = val if key == "limits.weekly_action" else int(val)
+                continue
             if key in ("parallel", "context_limit"):
                 val = int(val)
             elif key == "push":
@@ -1270,9 +1292,10 @@ def warp_tab_config(name, title, cwd, shell_cmd):
     return path
 
 
-def open_warp(name):
-    subprocess.Popen(["xdg-open", f"warp://tab_config/{name}"], stdin=subprocess.DEVNULL,
-                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True)
+def open_warp(name, errlog=None):
+    with open(errlog or os.devnull, "a") as err:
+        subprocess.Popen(["xdg-open", f"warp://tab_config/{name}"], stdin=subprocess.DEVNULL,
+                         stdout=err, stderr=err, start_new_session=True)
 
 
 def xdo(*args):
@@ -1285,7 +1308,7 @@ def xdo(*args):
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
-def open_warp_tab(name, title, cwd, shell_cmd, give_back=True):
+def open_warp_tab(name, title, cwd, shell_cmd, give_back=True, errlog=None):
     """Open a Warp tab and hand the keyboard back at once. Warp cannot open a tab in the background:
     the new tab takes focus, and Warp types its command into the tab's input, where a stray key
     breaks it. So wait until the tab is active (the window title becomes the tab's) and go back:
@@ -1295,7 +1318,7 @@ def open_warp_tab(name, title, cwd, shell_cmd, give_back=True):
     time.sleep(0.5)  # let Warp see the new file
     before = xdo("getactivewindow")
     in_warp = bool(before) and "warp" in xdo("getwindowclassname", before).lower()
-    open_warp(name)
+    open_warp(name, errlog)
     if not give_back:
         return
     end = time.time() + 5
@@ -1310,11 +1333,35 @@ def open_warp_tab(name, title, cwd, shell_cmd, give_back=True):
         time.sleep(0.03)
 
 
-def open_window(title, cwd, argv):
+def open_window(title, cwd, argv, errlog=None):
     """A gnome-terminal window running argv. It closes when argv ends."""
-    subprocess.Popen([shutil.which("gnome-terminal"), f"--working-directory={cwd}", "--title", title,
-                      "--", *argv], env=clean_env(), start_new_session=True,
-                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(errlog or os.devnull, "a") as err:
+        subprocess.Popen([shutil.which("gnome-terminal"), f"--working-directory={cwd}", "--title", title,
+                          "--", *argv], env=clean_env(), start_new_session=True,
+                         stdin=subprocess.DEVNULL, stdout=err, stderr=err)
+
+
+def wait_runner_start(d, since):
+    """After --new-terminal: True once the runner holds its lock or logged its start; the exit
+    message if it ended first; None on timeout. Waiting also keeps a caller that ends at once
+    (a systemd service, whose cgroup is killed when its main process exits) alive until the
+    terminal owns the runner."""
+    end = time.time() + RUNNER_START_SECONDS
+    while time.time() < end:
+        try:
+            with open(run_file(d, "runner.log")) as f:
+                f.seek(since)
+                new = f.read()
+        except OSError:
+            new = ""
+        lines = new.splitlines()
+        for line in lines:
+            if " exit: " in line:
+                return line.split(" exit: ", 1)[1]
+        if any(" runner start" in line for line in lines) or runner_alive(d):
+            return True
+        time.sleep(0.3)
+    return None
 
 
 def open_terminal(d, extra, term):
@@ -1326,14 +1373,32 @@ def open_terminal(d, extra, term):
     cmd += "; echo; read -rp 'Enter cierra esta terminal. '"
     if os.environ.get("TERM_PROGRAM") == "WarpTerminal":
         cmd = f"rm -f {shlex.quote(os.path.join(WARP_TAB_CONFIGS, f'roadmap-{name}-runner.toml'))}; " + cmd
-    if os.environ.get("TERM_PROGRAM") == "WarpTerminal" and shutil.which("xdg-open"):
-        open_warp_tab(f"roadmap-{name}-runner", f"roadmap {name}", root, cmd, give_back=False)
-        out(f"Runner de '{name}' abierto en una pestaña nueva de Warp ({root}).")
-        return
-    if not shutil.which("gnome-terminal"):
-        fail(f"no encuentro Warp ni gnome-terminal. Abrí una terminal y corré: cd {shlex.quote(root)} && roadmap execute {name}")
-    open_window(f"roadmap {name}", root, ["bash", "-lc", cmd])
-    out(f"Runner de '{name}' abierto en una terminal nueva ({root}).")
+    by_hand = f"Abrí una terminal y corré: cd {shlex.quote(root)} && roadmap execute {name}"
+    if runner_alive(d):
+        fail(f"ya hay un runner corriendo '{name}'")
+    warp = os.environ.get("TERM_PROGRAM") == "WarpTerminal" and shutil.which("xdg-open")
+    if not warp and not shutil.which("gnome-terminal"):
+        fail(f"no encuentro Warp ni gnome-terminal. {by_hand}")
+    os.makedirs(run_dir(d), exist_ok=True)
+    errlog = run_file(d, "terminal.log")
+    with open(errlog, "a") as f:
+        f.write(f"--- {now()} open runner terminal\n")
+    try:
+        since = os.path.getsize(run_file(d, "runner.log"))
+    except OSError:
+        since = 0
+    if warp:
+        open_warp_tab(f"roadmap-{name}-runner", f"roadmap {name}", root, cmd, give_back=False, errlog=errlog)
+        where = "una pestaña nueva de Warp"
+    else:
+        open_window(f"roadmap {name}", root, ["bash", "-lc", cmd], errlog=errlog)
+        where = "una terminal nueva"
+    started = wait_runner_start(d, since)
+    if started is None:
+        fail(f"pedí {where}, pero el runner no arrancó en {RUNNER_START_SECONDS} s. Mirá {errlog}. {by_hand}")
+    if started is not True:
+        fail(f"el runner arrancó en {where} y terminó enseguida: {started}")
+    out(f"Runner de '{name}' corriendo en {where} ({root}).")
 
 
 # ---------------------------------------------------------------- the runner
@@ -1348,7 +1413,8 @@ def wait_seconds(reset):
 
 def usage_gate(rm, u):
     """Before a launch: None to go, ('wait', seconds, msg) for the 5-hour window, ('skip', msg) for
-    a Fable unit over the Fable limit, ('stop', msg) at the weekly limit."""
+    a Fable unit over the Fable limit, ('stop', msg) at the weekly limit, or ('wait', ...) there
+    when limits.weekly_action is 'wait'."""
     lim = rm["limits"]
     model = str(u.get("model") or rm.get("default_model") or "").lower()
     us = read_usage()
@@ -1356,8 +1422,12 @@ def usage_gate(rm, u):
         return None
     wk, fb, fh = us.get("weekly"), us.get("fable"), us.get("five_hour")
     if wk and wk[0] >= lim["weekly"]:
+        if lim.get("weekly_action") == "wait":
+            return ("wait", wait_seconds(wk[1]), f"uso semanal al {wk[0]:.0f}% (tope {lim['weekly']}%). "
+                                                 f"No lanzo sesiones nuevas hasta el reinicio ({when(wk[1])}).")
         return ("stop", f"uso semanal al {wk[0]:.0f}% (tope {lim['weekly']}%). No lanzo más sesiones; "
-                        f"se reinicia {when(wk[1])}.")
+                        f"se reinicia {when(wk[1])}. Para que espere el reinicio en lugar de parar: "
+                        "roadmap config limits.weekly_action=wait")
     if fb and "fable" in model and fb[0] >= lim["fable"]:
         return ("skip", f"la unidad {u['id']} usa Fable y el límite de Fable está al {fb[0]:.0f}% "
                         f"(tope {lim['fable']}%); no la lanzo. Se reinicia {when(fb[1])}. "
@@ -1543,6 +1613,8 @@ def cmd_execute(a):
     if a.new_terminal:
         open_terminal(d, a.claude_args, term)
         return
+    global RUNNER_DIR
+    RUNNER_DIR = d
     if os.environ.get("CLAUDECODE"):
         fail("roadmap execute corre en una terminal, no adentro de Claude. Desde Claude usá /roadmap:execute.")
     if not sys.stdin.isatty():
@@ -1556,7 +1628,9 @@ def cmd_execute(a):
     try:
         fcntl.flock(lockf, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
+        RUNNER_DIR = None  # that runner's log is not ours to write
         fail("ya hay un runner corriendo este roadmap")
+    log(d, f"runner start pid={os.getpid()} terminal={term} parallel={par}")
     bad = problems(rm, d)
     if bad:
         die("roadmap.json tiene problemas:\n  " + "\n  ".join(bad))
@@ -1584,6 +1658,7 @@ def cmd_execute(a):
     def stop(msg):
         if not state["stopping"]:
             state["stopping"] = msg
+            log(d, f"stop: {msg}")
             say(msg + (f" Espero las {len(running)} sesiones en curso." if running else ""))
 
     # Sessions of a runner that died keep running in their tabs: adopt them, and process the
@@ -1844,8 +1919,14 @@ def cmd_execute(a):
                 continue
             if g and g[0] == "wait":
                 state["wait_until"] = time.time() + g[1]
+                if not state["waiting_said"]:
+                    log(d, f"wait: {g[2]}")
+                    state["waiting_said"] = True
                 say(g[2])
                 return
+            if state["waiting_said"]:
+                log(d, "wait over")
+                state["waiting_said"] = False
             if inline and state["ended"]:
                 pause = UNATTENDED_PAUSE_SECONDS if rm_["mode"] == "unattended" else PAUSE_SECONDS
                 say(f"la próxima sesión arranca en {pause} s. Ctrl+C para parar acá.")
@@ -1907,6 +1988,11 @@ def cmd_execute(a):
         say("pestañas listas.")
     try:
         loop()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as e:
+        log(d, f"exit: {type(e).__name__}: {e}")
+        raise
     finally:
         if term == "warp":
             for n in range(1, MAX_PARALLEL + 1):

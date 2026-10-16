@@ -19,7 +19,7 @@ Roadmap covers the part plan mode leaves out: a batch of tasks executed as many 
 | `mode` | `attended` or `unattended`. Read by the hooks on every call and by the runner before every session, so a change applies at once. |
 | `permission_mode` | `bypass` (default, `--dangerously-skip-permissions`), `auto`, `acceptEdits`, `default` |
 | `context_limit` | tokens per session; the post-tool hook warns at 60/80/93% of it. Default 150000. |
-| `limits` | `five_hour` (wait for the reset), `weekly` (stop), `fable` (stop before a Fable unit). Percent of the plan limit. Defaults 95/70/90: the thresholds of the original runners, plus Fable. |
+| `limits` | `five_hour` (wait for the reset), `weekly` (stop), `fable` (stop before a Fable unit). Percent of the plan limit. Defaults 95/70/90: the thresholds of the original runners, plus Fable. Optional `weekly_action`: `stop` (default) or `wait` for the weekly reset, as the 5-hour limit does. `roadmap config limits.<key>=…` changes them. |
 | `default_model` | `opus` |
 | `documentador` | `null`, or `{"project_id": …}` when the user asked for it |
 | `parallel` | sessions at the same time, 1-8. `1` (and missing): one session at a time in the repo's own checkout. More: worktrees (§10). |
@@ -49,9 +49,11 @@ A session that ends without a signal in under 45 s never reached its unit: the f
 
 `/roadmap:execute` cannot host the runner, because the runner must outlive every session. It opens `roadmap execute` in a new Warp tab when the session runs in Warp, else a new `gnome-terminal`, with the session variables stripped. The same name works in the terminal: `roadmap execute`.
 
+`--new-terminal` reports success only after the runner logs `runner start` in `run/runner.log` or holds `runner.lock`, within 30 s; else it fails with the runner's exit message or a pointer to `run/terminal.log` (the terminal's stderr). The wait matters beyond the message: a caller that ends at once inside its own cgroup (a systemd timer, `KillMode=control-group`) takes the `gnome-terminal` client down with it before it asks the server for the window. Bug of 2026-10-16: a timer relaunch printed "abierto" and nothing opened. The runner also logs `wait: <why>` (once per wait, then `wait over`), `stop: <why>` and `exit: <why>` (from `fail`/`die` once it owns the roadmap), so the reason survives the closed tab.
+
 ## 4. Usage limits
 
-Before each session the runner reads `https://api.anthropic.com/api/oauth/usage` with the OAuth token of `~/.claude/.credentials.json`, the endpoint `/usage` uses. The `limits` array has `kind: session` (5 hours), `weekly_all`, and `weekly_scoped` with `scope.model.display_name: "Fable"`. Older fields `five_hour` and `seven_day` are the fallback. If usage cannot be read, the runner goes on, as the original runners did. The limits are absolute thresholds, the user's choice on 2026-09-29, not a budget relative to the roadmap's start.
+Before each session the runner reads `https://api.anthropic.com/api/oauth/usage` with the OAuth token of `~/.claude/.credentials.json`, the endpoint `/usage` uses. The `limits` array has `kind: session` (5 hours), `weekly_all`, and `weekly_scoped` with `scope.model.display_name: "Fable"`. Older fields `five_hour` and `seven_day` are the fallback. If usage cannot be read, the runner goes on, as the original runners did. The limits are absolute thresholds, the user's choice on 2026-09-29, not a budget relative to the roadmap's start. `limits.weekly_action: "wait"` (added 2026-10-16) makes the weekly limit wait like the 5-hour one, rechecking every 10 minutes, so an overnight reset needs no external relaunch. The Fable limit keeps skipping Fable units.
 
 ## 5. Context awareness
 

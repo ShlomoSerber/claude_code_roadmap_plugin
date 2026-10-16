@@ -17,7 +17,7 @@ Plan mode plans one change and executes it in the same session. Roadmap is for a
 - **One session per unit.** Each session starts from zero context and reads only `ROADMAP.md`, its unit brief and what the brief names.
 - **Parallel sessions.** The plan draws the dependency graph and the paths each unit edits. The runner starts every unit whose dependencies are done, up to `parallel` at a time, each in its own git worktree and branch, and merges each closed unit into the roadmap branch. In Warp the sessions run in fixed tabs next to the runner's.
 - **A model per unit.** The runner launches each session with `--model <unit's model>`. The default is `opus`.
-- **Usage limits between sessions.** Before each session the runner reads the plan usage `/usage` shows. At the 5-hour limit it waits for the reset; at the weekly limit it stops; at the Fable limit it stops before a Fable unit.
+- **Usage limits between sessions.** Before each session the runner reads the plan usage `/usage` shows. At the 5-hour limit it waits for the reset; at the weekly limit it stops, or waits for the reset with `roadmap config limits.weekly_action=wait`; at the Fable limit it stops before a Fable unit.
 - **Context awareness inside a session.** A hook tells the session its context size at 60%, 80% and 93% of the limit (150k by default). The session then closes, hands off to a new session, or splits the unit.
 - **Unattended mode.** Hooks deny questions and plan mode, and refuse to let a session stop with its unit open. What needs you is blocked with a self-contained question; the run goes on with the next unit.
 - **Documentador, on request only.** If you ask for it while planning, the units become tasks and subtasks, and sessions move them.
@@ -90,7 +90,7 @@ roadmap list       # roadmaps in this repo
 roadmap usage      # 5 hour · weekly · Fable usage now
 roadmap blocked    # blocked units and their questions
 roadmap set 03 model=sonnet    # change a unit (title, model, status, est_tokens, depends_on, touches, task)
-roadmap config parallel=2      # roadmap options: parallel, branch, push, setup, context_limit, ...
+roadmap config parallel=2      # roadmap options: parallel, branch, push, setup, context_limit, limits.*, ...
 ```
 
 ## Files
@@ -100,7 +100,7 @@ roadmap config parallel=2      # roadmap options: parallel, branch, push, setup,
   roadmap.json     state: units, mode, limits, context limit, documentador
   ROADMAP.md       goal and the rules every session follows (branch, push, verification, forbidden)
   units/<id>-*.md  one brief per unit; sessions append Nota de cierre / traspaso / partición / bloqueo
-  run/             runner.log, locks, hook state; units/<id>/ (launch spec, pids, signal,
+  run/             runner.log, terminal.log, locks, hook state; units/<id>/ (launch spec, pids, signal,
                    heartbeat) and slots/<n>/ per session
 ```
 
