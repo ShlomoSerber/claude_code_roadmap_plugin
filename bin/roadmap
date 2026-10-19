@@ -9,7 +9,7 @@ A roadmap lives in <repo>/.claude/roadmaps/<name>/:
                  heartbeat, last session) per unit. Transient.
 
 For people:   execute, status, list, usage, attend, unattend, config, install-cli
-For sessions: brief, blocked, done, handoff, block, unblock, split, set, init, validate, next, baseline
+For sessions: brief, task, blocked, done, handoff, block, unblock, split, set, init, validate, next, baseline
 For hooks:    hook pre-tool|post-tool|stop   (scripts/hook.sh, only inside a runner session)
 For the runner: worker   (runs one session in its terminal tab or window)
 
@@ -344,6 +344,55 @@ def stuck(units, uid, seen=None):
     if u["status"] == "pending":
         return any(stuck(units, dep, seen) for dep in u.get("depends_on") or [] if dep != "*")
     return False
+
+
+def open_parts(ids, uid, skip, seen=None):
+    """Units under `uid` (itself, or the leaves of its splits) not yet done, `skip` excluded."""
+    seen = seen if seen is not None else set()
+    u = ids.get(uid)
+    if not u or uid in seen:
+        return []
+    seen.add(uid)
+    if u["status"] == "split":
+        return [x for c in u.get("children") or [] for x in open_parts(ids, c, skip, seen)]
+    return [] if u["status"] == "done" or uid == skip else [uid]
+
+
+def task_duties(rm, uid):
+    """The documentador tasks a unit's session works on: its own `task`, and the task of every
+    ancestor it is a split part of. For each: (task, owner unit, other open parts). No other
+    open part means this session completes the task; otherwise it only comments."""
+    if not rm.get("documentador"):
+        return []
+    ids = by_id(rm)
+    duties, cur, seen = [], uid, set()
+    while cur in ids and cur not in seen:
+        seen.add(cur)
+        n = ids[cur]
+        if n.get("task") not in (None, ""):
+            duties.append((n["task"], cur, [] if cur == uid else open_parts(ids, cur, uid)))
+        cur = n.get("parent")
+    return duties
+
+
+def duty_lines(rm, uid):
+    doc = rm.get("documentador")
+    duties = task_duties(rm, uid)
+    if not duties:
+        return ["Documentador: off"]
+    lines = []
+    for task, owner, others in duties:
+        head = f"Documentador: project {doc['project_id']} · task {task}"
+        if owner == uid:
+            lines.append(f"{head} (this unit's own). This session completes it: complete_task when the unit closes.")
+        elif others:
+            lines.append(f"{head} (of unit {owner}, split; shared with its other open parts: {', '.join(others)}). "
+                         "This session only comments: add_task_comment with what this part delivered; never complete_task.")
+        else:
+            lines.append(f"{head} (of unit {owner}, split; this is its last open part). This session completes it: "
+                         f"complete_task with an output covering all of unit {owner}: what every part delivered "
+                         "(their Notas de cierre) and what was left out.")
+    return lines
 
 
 def overlaps(a, b):
@@ -720,7 +769,6 @@ def cmd_brief(a):
     d = resolve(name)
     rm = load(d)
     uid = uid or os.environ.get("ROADMAP_UNIT")
-    doc = rm.get("documentador")
     out(f"Roadmap: {rm['name']} · {rm['title']}")
     out(f"Directory: {d}")
     out(f"Repo: {repo_of(d)}")
@@ -742,10 +790,8 @@ def cmd_brief(a):
     if u.get("pending_merge"):
         out(f"Pending merge: {u['pending_merge']}. Before anything else, `git merge {u['pending_merge']}` in the "
             "worktree, resolve the conflicts keeping the intent of both sides, verify, and commit.")
-    if doc and u.get("task"):
-        out(f"Documentador: project {doc['project_id']} · task {u['task']}")
-    else:
-        out("Documentador: off")
+    for line in duty_lines(rm, uid):
+        out(line)
     out("\n===== ROADMAP.md =====")
     try:
         out(open(os.path.join(d, "ROADMAP.md")).read().rstrip())
@@ -756,6 +802,16 @@ def cmd_brief(a):
         out(open(os.path.join(d, u["file"])).read().rstrip())
     except OSError:
         out("(missing unit file)")
+
+
+def cmd_task(a):
+    """The documentador duty of a unit, recomputed now: complete or only comment."""
+    d = resolve(rname(a))
+    rm = load(d)
+    uid = unit_arg(a.unit)
+    get_unit(rm, uid)
+    for line in duty_lines(rm, uid):
+        out(line)
 
 
 def cmd_done(a):
@@ -994,7 +1050,8 @@ def cmd_blocked(a):
         b = u.get("blocked") or {}
         out(f"== {u['id']} · {u['title']}")
         out(f"   file: {os.path.join(d, u['file'])}")
-        out(f"   since: {b.get('since', '?')}" + (f" · documentador task {u['task']}" if u.get("task") else ""))
+        tasks = ", ".join(str(t) if o == u["id"] else f"{t} (of {o})" for t, o, _ in task_duties(rm, u["id"]))
+        out(f"   since: {b.get('since', '?')}" + (f" · documentador task {tasks}" if tasks else ""))
         out(f"   question: {b.get('question', '')}")
     ids = by_id(rm)
     waiting = [u["id"] for u in rm["units"] if u["status"] == "pending" and "*" not in (u.get("depends_on") or [])
@@ -2205,6 +2262,8 @@ def main():
                             ("handoff", cmd_handoff, "pasar la unidad a una sesión nueva")):
         p = add(name, fn, help_)
         p.add_argument("unit", nargs="?")
+    p = add("task", cmd_task, "qué hace la sesión con la tarea del documentador: completar o comentar")
+    p.add_argument("unit", nargs="?")
     p = add("block", cmd_block, "bloquear la unidad con una pregunta para el usuario")
     p.add_argument("unit")
     p.add_argument("question")

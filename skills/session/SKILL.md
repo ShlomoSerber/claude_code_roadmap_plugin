@@ -52,8 +52,12 @@ file by hand, and never touch the status of another unit.
 1. **Orient.** If the brief shows `Pending merge`, do that merge first, as it says. If the unit file has a `## Nota de traspaso`, `## Nota del runner` or answers from
    `/roadmap:attend`, start from them: check `git log --oneline -15` and `git status` against the
    note, and redo whatever it says was not committed.
-2. **Documentador**, only when the brief shows `Documentador: project … · task …`: `start_task` on
-   that task. If `ROADMAP.md` names who to assign it to, `update_task` with that assignee too.
+2. **Documentador**, only when the brief shows `Documentador: project … · task …` (one line per
+   task; `Documentador: off` means none). Each line says whose task it is and what this session
+   does with it: **completes** it, or **only comments**. A task "of unit X, split" belongs to the
+   whole unit X: this unit is one part of it, and the other parts share it. `start_task` on each
+   task unless `get_task` shows it already in progress (an earlier part started it). If
+   `ROADMAP.md` names who to assign it to, `update_task` with that assignee too.
 3. **Read** what the unit names.
 4. **Do the work**, following the unit's "Cómo" and the repo's own conventions (`CLAUDE.md`).
 5. **Verify** with the unit's "Verificación" and the roadmap's rules. Red means not done: fix it,
@@ -62,15 +66,20 @@ file by hand, and never touch the status of another unit.
 7. **Close.**
    - Append `## Nota de cierre` to the unit file: commits, what was delivered, what was left out of
      the scope, assumptions you took, and what later units must know. Five to fifteen lines.
-   - Documentador (if on): `complete_task` with an output saying what was delivered and, above all,
-     what was left out.
+   - Documentador (if on): run `roadmap task` first. It recomputes the brief's line now, since
+     units may have been split or added meanwhile. For each task it prints:
+     - "only comments": `add_task_comment` with what this part delivered and what it left out.
+       Never `complete_task`: other parts of the unit are still open.
+     - "completes": `complete_task` with an output saying what was delivered and, above all, what
+       was left out. For a task "of unit X", the output covers all of X: read the `## Nota de
+       cierre` of X's other parts and sum up every part, not only this one.
    - Run `roadmap done` as the **last** tool call, then end the turn with a two-line summary.
 
 ## Handing off
 
 When the unit does not fit this session (context, or it grew): commit what is green, then append
 `## Nota de traspaso` to the unit file: what is done, what is next, what is not committed and must
-be redone. Documentador (if on): `add_task_comment` with the same. Then `roadmap handoff` as the
+be redone. Documentador (if on): `add_task_comment` with the same, on every task the brief lists. Then `roadmap handoff` as the
 last tool call, and end the turn. The next session continues the same unit from your note. A
 unit that hands off three times in a row is stopped (attended) or blocked (unattended).
 
@@ -85,13 +94,17 @@ When what is left is clearly more than one more session, split instead of handin
    on the previous one. Units that depended on this one now wait for all of them.
 4. Fill in every brief it printed: Alcance, the Decisiones each part needs (copied in full), Leer
    antes, Cómo, Verificación. The next sessions start from those files alone.
-5. End the turn.
+5. Documentador (if on): `add_task_comment` on every task the brief lists, with what is done and
+   the new parts. Never `complete_task`: the task stays in progress, and the parts carry it. Each
+   part's brief tells its session whether it comments or completes; the last part completes it.
+6. End the turn.
 
 ## Blocking
 
 When the unit needs the user (a decision nobody wrote down, credentials, access, something only
 a person can do): commit whatever is useful, append `## Nota de bloqueo` (what is done, what waits
-on what), documentador `block_task` if on, then run as the last tool call:
+on what), documentador `block_task` on every task the brief lists (a split unit's task waits on
+this part too), then run as the last tool call:
 
 ```bash
 roadmap block <unit> "<question>"

@@ -39,7 +39,11 @@ yourself.
      fill in the new briefs.
    - Drop the unit: append a `## Descartada` note with the user's reason, then
      `roadmap unblock -r <name> <unit>` and `roadmap set -r <name> <unit> status=done`.
-   - Documentador (if the unit has a task): `unblock_task`, and a comment with the answer.
+   - Documentador (if `roadmap blocked` lists a task for the unit; "of <unit>" means the task of
+     the split unit it is part of): `unblock_task`, and a comment with the answer. When you
+     dropped the unit, `roadmap task -r <name> <unit>`: if it says "completes", nothing else will
+     close that task, so `complete_task` it now, with an output covering the whole unit (every
+     part's `## Nota de cierre`, and what was dropped).
 6. **Hand back.** Show `roadmap status`. Tell the user to close this session and run
    `roadmap execute` (or `/roadmap:execute`). The roadmap stays attended until they run
    `roadmap unattend` again.

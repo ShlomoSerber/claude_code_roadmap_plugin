@@ -20,7 +20,7 @@ Plan mode plans one change and executes it in the same session. Roadmap is for a
 - **Usage limits between sessions.** Before each session the runner reads the plan usage `/usage` shows. At the 5-hour limit it waits for the reset; at the weekly limit it stops, or waits for the reset with `roadmap config limits.weekly_action=wait`; at the Fable limit it stops before a Fable unit.
 - **Context awareness inside a session.** A hook tells the session its context size at 60%, 80% and 93% of the limit (150k by default). The session then closes, hands off to a new session, or splits the unit.
 - **Unattended mode.** Hooks deny questions and plan mode, and refuse to let a session stop with its unit open. What needs you is blocked with a self-contained question; the run goes on with the next unit.
-- **Documentador, on request only.** If you ask for it while planning, the units become tasks and subtasks, and sessions move them.
+- **Documentador, on request only.** If you ask for it while planning, the units become tasks and subtasks, and sessions move them. When a unit splits, its parts share its task: each part comments its progress there, and the last one completes it.
 
 ## Usage
 
